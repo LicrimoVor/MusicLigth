@@ -1,20 +1,19 @@
 import tinytuya
-from core.const import DEVICE_IP, DEVICE_LOCAL
+
+from core.const import get_lamp_devices
 
 
 def init_lamp():
     devices: list[tinytuya.BulbDevice] = []
-    for device_id, ip in DEVICE_IP.items():
-        local_key = DEVICE_LOCAL.get(device_id)
+    for lamp in get_lamp_devices(enabled_only=True):
+        device_id = lamp["id"]
+        ip = lamp.get("ip")
+        local_key = lamp.get("local_key")
+        if not ip or not local_key:
+            continue
+
         device = tinytuya.BulbDevice(device_id, ip, local_key)
-        device.set_version(3.5)
-
-        # Инициализация устройства
-        print(device.status(), local_key)
-
-        # Теперь можно включать режим музыки
-        device.set_mode("music")
-        device.set_music_colour(0, 0, 0, 0, 0, None, True)
+        device.set_version(float(lamp.get("version", "3.5")))
         device.set_socketPersistent(True)
         devices.append(device)
 

@@ -1,50 +1,69 @@
-from pathlib import Path
+from __future__ import annotations
+
 import json
+from pathlib import Path
 
 
 BASE_PATH = Path(__file__).parent.parent
+CORE_PATH = BASE_PATH / "core"
+LAMP_CONFIG_PATH = CORE_PATH / "lamps.json"
 
-with open(BASE_PATH.joinpath("core/snapshot.json")) as f:
-    d = json.load(f)
-DEVICE_IP = {device["id"]: device["ip"] for device in d["devices"]}
 
+def _position(value):
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    return (float(value[0]), float(value[1]))
+
+
+def load_lamp_config(path: Path = LAMP_CONFIG_PATH) -> dict:
+    with path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    devices = []
+    for device in data.get("devices", []):
+        device_id = device.get("id")
+        if not device_id:
+            continue
+        normalized = dict(device)
+        normalized["position"] = _position(device.get("position"))
+        normalized["version"] = str(device.get("version") or device.get("ver") or "3.5")
+        normalized["local_key"] = device.get("local_key") or device.get("key") or ""
+        normalized["enabled"] = bool(device.get("enabled", True))
+        devices.append(normalized)
+
+    data["devices"] = devices
+    return data
+
+
+LAMP_CONFIG = load_lamp_config()
+LAMP_DEVICES = LAMP_CONFIG["devices"]
+
+DEVICE_IP = {
+    device["id"]: device["ip"]
+    for device in LAMP_DEVICES
+    if device.get("ip")
+}
 
 DEVICE_LOCAL = {
-    "bf7d83acbfbab53cd44ign": "1vjT&upb7d2-2y?+",
-    "bfe54d10d2e3ade05dtln0": "z5+_vK9~p!@S/Vq6",
-    "bf8848fb5d7b7a568drlsq": "sn-;71NM?F6VXoRf",
-    "bff31a95d7f1a6f2d4qtyx": "7-cDK51:&+&gO]rL",
-    "bfe331579ebc27528cy2ax": ">gVA==q!@4!nOA(s",
-    "bf5e44965ed19fd2c4ppel": "-ubJ0R?A|}Zn>sl=",
-    "bf49dd04e681068f35izf9": "Yi:i~C#MAo8;VES;",
-    "bf38fd090103ffb48cjkwy": "(kVkTWn|3'<+9lfn",
-    "bfa81b616f3eb626de6gja": "4!7]]rC}Z49?ocq)",
-    "bfbd4cb669009901e7p2fh": "<A_{R/Lvvui6qvOi",
+    device["id"]: device["local_key"]
+    for device in LAMP_DEVICES
+    if device.get("local_key")
 }
 
+DEVICE_VERSION = {
+    device["id"]: device["version"]
+    for device in LAMP_DEVICES
+}
 
 LAMP_POSITION = {
-    "bf7d83acbfbab53cd44ign": (0, 0),
-    # "bfe54d10d2e3ade05dtln0": (0, 0.33),
-    "bf8848fb5d7b7a568drlsq": (0, 0.66),
-    # "bff31a95d7f1a6f2d4qtyx": (0, 1),
-    # "bfe331579ebc27528cy2ax": (1, 0),
-    # "bf5e44965ed19fd2c4ppel": (1, 0.33),
-    # "bf49dd04e681068f35izf9": (1, 0.66),
-    "bf38fd090103ffb48cjkwy": (1, 1),
-    "bfa81b616f3eb626de6gja": (0.5, 0.165),
-    # "bfbd4cb669009901e7p2fh": (0.5, 0.825),
+    device["id"]: device["position"]
+    for device in LAMP_DEVICES
+    if device.get("position") is not None
 }
 
-# DEVICE_IP = {
-#     "bfa81b616f3eb626de6gja": "192.168.1.33",
-#     "bfe54d10d2e3ade05dtln0": "192.168.1.34",
-#     "bf38fd090103ffb48cjkwy": "192.168.1.35",
-#     "bf7d83acbfbab53cd44ign": "192.168.1.36",
-#     "bf49dd04e681068f35izf9": "192.168.1.37",
-#     "bf5e44965ed19fd2c4ppel": "192.168.1.38",
-#     "bfbd4cb669009901e7p2fh": "192.168.1.39",
-#     "bfe331579ebc27528cy2ax": "192.168.1.40",
-#     "bf8848fb5d7b7a568drlsq": "192.168.1.41",
-#     "bff31a95d7f1a6f2d4qtyx": "192.168.1.42",
-# }
+
+def get_lamp_devices(enabled_only: bool = False) -> list[dict]:
+    devices = LAMP_DEVICES
+    if enabled_only:
+        devices = [device for device in devices if device.get("enabled", True)]
+    return [dict(device) for device in devices]
