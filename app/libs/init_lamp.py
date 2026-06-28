@@ -3,6 +3,13 @@ import tinytuya
 from core.const import get_lamp_devices
 
 
+DEFAULT_BULB_MAPPING = {
+    "value_min": 10,
+    "value_max": 1000,
+    "value_hexformat": "hsv16",
+}
+
+
 def init_lamp():
     devices: list[tinytuya.BulbDevice] = []
     for lamp in get_lamp_devices(enabled_only=True):
@@ -12,8 +19,13 @@ def init_lamp():
         if not ip or not local_key:
             continue
 
+        bulb_mapping = dict(DEFAULT_BULB_MAPPING)
+        if isinstance(lamp.get("dps"), dict):
+            bulb_mapping.update(lamp["dps"])
+
         device = tinytuya.BulbDevice(device_id, ip, local_key)
         device.set_version(float(lamp.get("version", "3.5")))
+        device.set_bulb_type(str(lamp.get("bulb_type") or "B").upper(), mapping=bulb_mapping)
         device.set_socketPersistent(True)
         devices.append(device)
 

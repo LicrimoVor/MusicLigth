@@ -5,6 +5,13 @@ import time
 import tinytuya
 
 
+DEFAULT_BULB_MAPPING = {
+    "value_min": 10,
+    "value_max": 1000,
+    "value_hexformat": "hsv16",
+}
+
+
 class AsyncTuyaDevice:
     def __init__(self, device: tinytuya.BulbDevice):
         self.device = device
@@ -13,11 +20,17 @@ class AsyncTuyaDevice:
     async def send_command(self, command, *args):
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(None, partial(getattr(self.device, command), *args))
+            result = await loop.run_in_executor(None, partial(getattr(self.device, command), *args))
+            if isinstance(result, dict) and result.get("Error"):
+                self.last_error = str(result)
+                print(f"Ошибка при выполнении {command} на устройстве {self.device.id}: {result}")
+                return result
             self.last_error = ""
+            return result
         except Exception as exc:
             self.last_error = str(exc)
             print(f"Ошибка при выполнении {command} на устройстве {self.device.id}: {exc}")
+            return None
 
     async def diagnose(self):
         loop = asyncio.get_running_loop()
@@ -57,7 +70,17 @@ class TuyaLampController:
         self.async_devices = [AsyncTuyaDevice(dev) for dev in devices]
 
     async def set_color(self, device, r, g, b, brightness):
-        await device.send_command("set_music_colour", 0, r, g, b, brightness, None, True)
+        tuya_brightness = brightness * 100 if 0 <= brightness <= 1 else brightness
+        switch = device.device.dpset.get("switch") or "20"
+        if tuya_brightness <= 0 or (r, g, b) == (0, 0, 0):
+            await device.send_command("set_status", False, switch, False)
+            return
+
+        await device.send_command("set_status", True, switch, True)
+        await device.send_command("set_music_colour", 0, r, g, b, tuya_brightness, None, True)
+        if "Bulb not configured" in device.last_error:
+            device.device.set_bulb_type("B", mapping=DEFAULT_BULB_MAPPING)
+            await device.send_command("set_music_colour", 0, r, g, b, tuya_brightness, None, True)
 
     async def set_colors(self, colors_dict, brightness=1.0):
         tasks = []
