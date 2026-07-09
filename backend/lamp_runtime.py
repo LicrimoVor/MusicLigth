@@ -8,7 +8,7 @@ import time
 from threading import Event, RLock, Thread
 from typing import Any
 
-from .config import APP_DIR
+from config import APP_DIR
 
 
 def hex_to_rgb(value: str) -> tuple[int, int, int]:
@@ -70,10 +70,7 @@ class LampRuntime:
                 "error": "Preset has no enabled lamps",
             }
 
-        command_colors = {
-            lamp_id: colors.get(lamp_id, (0, 0, 0))
-            for lamp_id in enabled_lamp_ids
-        }
+        command_colors = {lamp_id: colors.get(lamp_id, (0, 0, 0)) for lamp_id in enabled_lamp_ids}
         off_lamp_count = len(command_colors) - len(colors)
         effect = str(preset.get("effect") or "static").lower()
         if effect in {"fire", "pulse", "wave"}:
@@ -208,7 +205,15 @@ class LampRuntime:
         stop_event = Event()
         thread = Thread(
             target=self._animation_loop,
-            args=(stop_event, effect, active_colors, brightness_ratio, lamps, preset, active_lamp_count),
+            args=(
+                stop_event,
+                effect,
+                active_colors,
+                brightness_ratio,
+                lamps,
+                preset,
+                active_lamp_count,
+            ),
             daemon=True,
         )
         with self._animation_lock:

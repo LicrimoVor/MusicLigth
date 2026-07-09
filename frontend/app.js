@@ -15,7 +15,8 @@ const state = {
 	busy: false,
 };
 
-const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
+const hasOwn = (object, key) =>
+	Object.prototype.hasOwnProperty.call(object || {}, key);
 
 const api = async (path, options = {}) => {
 	const headers = {
@@ -23,7 +24,7 @@ const api = async (path, options = {}) => {
 		...(options.headers || {}),
 	};
 	if (state.token) headers.Authorization = `Bearer ${state.token}`;
-	const response = await fetch(path, { ...options, headers });
+	const response = await fetch("music" + path, { ...options, headers });
 	const data = await response.json().catch(() => ({}));
 	if (!response.ok) {
 		throw new Error(data.error || `HTTP ${response.status}`);
@@ -54,9 +55,11 @@ const effectLabel = (effect) =>
 
 const sourcePreset = () => state.draft || currentPreset();
 
-const includedLampIds = (preset = sourcePreset()) => Object.keys(preset?.colors || {});
+const includedLampIds = (preset = sourcePreset()) =>
+	Object.keys(preset?.colors || {});
 
-const isLampIncluded = (lampId, preset = sourcePreset()) => hasOwn(preset?.colors, lampId);
+const isLampIncluded = (lampId, preset = sourcePreset()) =>
+	hasOwn(preset?.colors, lampId);
 
 const colorForLamp = (lampId) => {
 	const source = sourcePreset();
@@ -107,7 +110,9 @@ const applyServerState = (payload) => {
 	if (
 		!state.draft &&
 		(!state.selectedPresetId ||
-			!state.presets.some((preset) => preset.id === state.selectedPresetId))
+			!state.presets.some(
+				(preset) => preset.id === state.selectedPresetId,
+			))
 	) {
 		state.selectedPresetId =
 			state.runtime.current_preset_id || state.presets[0]?.id || "";
@@ -173,14 +178,16 @@ const selectPreset = (presetId) => {
 	state.selectedPresetId = presetId;
 	state.draft = null;
 	const preset = currentPreset();
-	state.selectedLampId = includedLampIds(preset)[0] || state.lamps[0]?.id || "";
+	state.selectedLampId =
+		includedLampIds(preset)[0] || state.lamps[0]?.id || "";
 	render();
 };
 
 const startEdit = (preset) => {
 	state.selectedPresetId = preset.id;
 	state.draft = clonePreset(preset);
-	state.selectedLampId = includedLampIds(state.draft)[0] || state.lamps[0]?.id || "";
+	state.selectedLampId =
+		includedLampIds(state.draft)[0] || state.lamps[0]?.id || "";
 	render();
 };
 
@@ -229,7 +236,9 @@ const updateLampColor = (lampId, color) => {
 const fillAll = () => {
 	if (!state.draft) return;
 	const color = state.draft.colors?.[state.selectedLampId] || "#ff9f43";
-	state.draft.colors = Object.fromEntries(state.lamps.map((lamp) => [lamp.id, color]));
+	state.draft.colors = Object.fromEntries(
+		state.lamps.map((lamp) => [lamp.id, color]),
+	);
 	render();
 };
 
@@ -300,7 +309,9 @@ const applyPreset = async (presetId) => {
 		const result = payload.apply_result || {};
 		const dry = result.dry_run ? " dry-run" : "";
 		const mode = result.animation ? "анимация" : "применено";
-		const off = result.off_lamp_count ? `, выключено ${result.off_lamp_count}` : "";
+		const off = result.off_lamp_count
+			? `, выключено ${result.off_lamp_count}`
+			: "";
 		state.status = `${mode}:${dry} ${result.lamp_count ?? 0} ламп${off}`;
 	} catch (error) {
 		state.status = error.message;
@@ -402,7 +413,9 @@ const renderMap = () => {
 const renderPresetCard = (preset) => {
 	const active = preset.id === state.runtime.current_preset_id;
 	const selected = preset.id === state.selectedPresetId;
-	const presetLamps = state.lamps.filter((lamp) => isLampIncluded(lamp.id, preset));
+	const presetLamps = state.lamps.filter((lamp) =>
+		isLampIncluded(lamp.id, preset),
+	);
 	const swatches = presetLamps
 		.map(
 			(lamp) =>
@@ -592,15 +605,19 @@ const renderApp = () => {
 		);
 	});
 	app.querySelector("[data-new]")?.addEventListener("click", newPreset);
-	app
-		.querySelector("[data-diagnostics]")
-		?.addEventListener("click", runDiagnostics);
-	app.querySelectorAll("[data-lamp], [data-select-lamp]").forEach((button) => {
-		button.addEventListener("click", () => {
-			state.selectedLampId = button.dataset.lamp || button.dataset.selectLamp;
-			render();
-		});
-	});
+	app.querySelector("[data-diagnostics]")?.addEventListener(
+		"click",
+		runDiagnostics,
+	);
+	app.querySelectorAll("[data-lamp], [data-select-lamp]").forEach(
+		(button) => {
+			button.addEventListener("click", () => {
+				state.selectedLampId =
+					button.dataset.lamp || button.dataset.selectLamp;
+				render();
+			});
+		},
+	);
 	app.querySelector("[data-cancel]")?.addEventListener("click", () => {
 		state.draft = null;
 		render();
@@ -610,11 +627,15 @@ const renderApp = () => {
 	app.querySelector("[data-clear]")?.addEventListener("click", clearAll);
 	app.querySelectorAll("[data-include]").forEach((input) => {
 		input.addEventListener("click", (event) => event.stopPropagation());
-		input.addEventListener("change", () => setLampIncluded(input.dataset.include, input.checked));
+		input.addEventListener("change", () =>
+			setLampIncluded(input.dataset.include, input.checked),
+		);
 	});
 	app.querySelectorAll("[data-lamp-color]").forEach((input) => {
 		input.addEventListener("click", (event) => event.stopPropagation());
-		input.addEventListener("input", () => updateLampColor(input.dataset.lampColor, input.value));
+		input.addEventListener("input", () =>
+			updateLampColor(input.dataset.lampColor, input.value),
+		);
 	});
 	app.querySelectorAll("[data-draft]").forEach((input) => {
 		input.addEventListener("input", () => {

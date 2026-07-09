@@ -9,8 +9,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-from .config import LAMP_CONFIG_PATH, data_dir
-
+from config import LAMP_CONFIG_PATH, data_dir
 
 HEX_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
@@ -180,7 +179,9 @@ class PresetStore:
             state = read_json(self.state_path, self._default_runtime_state())
             return {**self._default_runtime_state(), **state}
 
-    def set_current_preset(self, preset_id: str | None, result: dict[str, Any] | None) -> dict[str, Any]:
+    def set_current_preset(
+        self, preset_id: str | None, result: dict[str, Any] | None
+    ) -> dict[str, Any]:
         with self._lock:
             state = self.get_runtime_state()
             state.update(
@@ -289,7 +290,9 @@ class PresetStore:
         warm = filled("#ff9f43")
         night = filled("#2446ff")
         fire_palette = ["#ff3b1f", "#ff6f1f", "#ffb000", "#ff4d00", "#ffd166"]
-        fire = {lamp["id"]: fire_palette[index % len(fire_palette)] for index, lamp in enumerate(lamps)}
+        fire = {
+            lamp["id"]: fire_palette[index % len(fire_palette)] for index, lamp in enumerate(lamps)
+        }
 
         return [
             self._normalize_preset(

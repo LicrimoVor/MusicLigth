@@ -1,3 +1,5 @@
+from collections import deque
+
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -96,33 +98,45 @@ class SpectrumWidget(QtWidgets.QWidget):
 
 
 class BeatGraphWidget(QtWidgets.QWidget):
-    def __init__(self, max_points=240):
+    def __init__(self, max_points=90):
         super().__init__()
-        self.setMinimumHeight(320)
+        self.setMinimumHeight(220)
         self.max_points = max_points
-        self.history = []
+        self.history = deque(maxlen=max_points)
+        self._background = None
+        self._background_size = QtCore.QSize()
 
     def set_history(self, history):
-        self.history = list(history)[-self.max_points :]
+        self.history = deque((clamp(float(value)) for value in history), maxlen=self.max_points)
         self.update()
 
     def add_level(self, level):
         self.history.append(clamp(float(level)))
-        if len(self.history) > self.max_points:
-            self.history = self.history[-self.max_points :]
         self.update()
 
     def clear(self):
-        self.history = []
+        self.history.clear()
         self.update()
 
-    def paintEvent(self, event):
-        painter = QtGui.QPainter(self)
+    def resizeEvent(self, event):
+        self._background = None
+        self._background_size = QtCore.QSize()
+        super().resizeEvent(event)
+
+    def plot_rect(self):
+        return self.rect().adjusted(48, 28, -18, -38)
+
+    def background_pixmap(self):
+        if self._background is not None and self._background_size == self.size():
+            return self._background
+
+        pixmap = QtGui.QPixmap(self.size())
+        pixmap.fill(QtGui.QColor("#0d1115"))
+        painter = QtGui.QPainter(pixmap)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         rect = self.rect()
-        painter.fillRect(rect, QtGui.QColor("#0d1115"))
+        plot = self.plot_rect()
 
-        plot = rect.adjusted(48, 28, -18, -38)
         painter.setPen(QtGui.QPen(QtGui.QColor("#26313a"), 1))
         painter.drawRoundedRect(plot, 6, 6)
 
@@ -139,18 +153,29 @@ class BeatGraphWidget(QtWidgets.QWidget):
 
         painter.setPen(QtGui.QColor("#c8d2dc"))
         painter.drawText(rect.adjusted(12, 8, -12, -8), QtCore.Qt.AlignTop, "График бита")
+        painter.end()
+
+        self._background = pixmap
+        self._background_size = self.size()
+        return pixmap
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.drawPixmap(0, 0, self.background_pixmap())
+        plot = self.plot_rect()
 
         if len(self.history) >= 2:
             path = QtGui.QPainterPath()
-            points = self.history[-self.max_points :]
+            points = list(self.history)
             step = plot.width() / max(1, self.max_points - 1)
             start_x = plot.right() - step * (len(points) - 1)
-            first_y = plot.bottom() - clamp(points[0]) * plot.height()
+            first_y = plot.bottom() - points[0] * plot.height()
             path.moveTo(start_x, first_y)
 
             for index, level in enumerate(points[1:], 1):
                 x = start_x + step * index
-                y = plot.bottom() - clamp(level) * plot.height()
+                y = plot.bottom() - level * plot.height()
                 path.lineTo(x, y)
 
             fill_path = QtGui.QPainterPath(path)
@@ -221,11 +246,24 @@ def app_stylesheet():
         color: #69747e;
         background: #20262c;
     }
-    QComboBox, QSpinBox {
+    QComboBox, QSpinBox, QLineEdit {
         background: #0f1419;
         border: 1px solid #35414b;
         border-radius: 5px;
         padding: 6px;
+    }
+    QListWidget {
+        background: #0f1419;
+        border: 1px solid #303941;
+        border-radius: 6px;
+        padding: 4px;
+    }
+    QListWidget::item {
+        padding: 7px;
+        border-radius: 4px;
+    }
+    QListWidget::item:selected {
+        background: #34404a;
     }
     QTabWidget::pane {
         border: 1px solid #303941;

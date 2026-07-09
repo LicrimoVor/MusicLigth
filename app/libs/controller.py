@@ -77,10 +77,11 @@ class TuyaLampController:
             return
 
         await device.send_command("set_status", True, switch, True)
-        await device.send_command("set_music_colour", 0, r, g, b, tuya_brightness, None, True)
+        # In music mode this brightness argument drives the white channel; RGB is already scaled by callers.
+        await device.send_command("set_music_colour", 0, r, g, b, 0, 0, True)
         if "Bulb not configured" in device.last_error:
             device.device.set_bulb_type("B", mapping=DEFAULT_BULB_MAPPING)
-            await device.send_command("set_music_colour", 0, r, g, b, tuya_brightness, None, True)
+            await device.send_command("set_music_colour", 0, r, g, b, 0, 0, True)
 
     async def set_colors(self, colors_dict, brightness=1.0):
         tasks = []

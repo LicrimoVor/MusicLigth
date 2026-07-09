@@ -12,14 +12,13 @@ from pathlib import Path
 from threading import Thread
 from urllib.parse import unquote, urlparse
 
-
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.config import FRONTEND_DIR, env_bool, env_int, load_dotenv
-from backend.lamp_runtime import LampRuntime
-from backend.security import AuthManager
-from backend.storage import PresetStore, ValidationError
+from config import FRONTEND_DIR, env_bool, env_int, load_dotenv
+from lamp_runtime import LampRuntime
+from security import AuthManager
+from storage import PresetStore, ValidationError
 
 
 class HttpError(Exception):
@@ -65,7 +64,9 @@ class MusicLightHandler(BaseHTTPRequestHandler):
         self._dispatch()
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
+        sys.stderr.write(
+            "%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args)
+        )
 
     def _dispatch(self):
         path = urlparse(self.path).path
@@ -88,7 +89,9 @@ class MusicLightHandler(BaseHTTPRequestHandler):
         parts = [part for part in path.strip("/").split("/") if part]
 
         if method == "GET" and path == "/api/health":
-            self._send_json(HTTPStatus.OK, {"ok": True, "lamp_runtime": self.server.context.lamps.status()})
+            self._send_json(
+                HTTPStatus.OK, {"ok": True, "lamp_runtime": self.server.context.lamps.status()}
+            )
             return
 
         if method == "POST" and path == "/api/login":
@@ -123,7 +126,9 @@ class MusicLightHandler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/presets":
             self._require_admin(role)
             preset = self.server.context.store.create_preset(self._read_json_body())
-            self._send_json(HTTPStatus.CREATED, {"preset": preset, "state": self._state_payload(role)})
+            self._send_json(
+                HTTPStatus.CREATED, {"preset": preset, "state": self._state_payload(role)}
+            )
             return
 
         if len(parts) == 3 and parts[:2] == ["api", "presets"]:
@@ -133,11 +138,16 @@ class MusicLightHandler(BaseHTTPRequestHandler):
                 preset = self.server.context.store.update_preset(preset_id, self._read_json_body())
                 if not preset:
                     raise HttpError(HTTPStatus.NOT_FOUND, "Пресет не найден")
-                self._send_json(HTTPStatus.OK, {"preset": preset, "state": self._state_payload(role)})
+                self._send_json(
+                    HTTPStatus.OK, {"preset": preset, "state": self._state_payload(role)}
+                )
                 return
             if method == "DELETE":
                 self._require_admin(role)
-                was_current = self.server.context.store.get_runtime_state().get("current_preset_id") == preset_id
+                was_current = (
+                    self.server.context.store.get_runtime_state().get("current_preset_id")
+                    == preset_id
+                )
                 deleted = self.server.context.store.delete_preset(preset_id)
                 if not deleted:
                     raise HttpError(HTTPStatus.NOT_FOUND, "Пресет не найден")
@@ -268,7 +278,9 @@ def parse_args(argv=None):
     parser.add_argument("--host", default=os.environ.get("MUSICLIGHT_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=env_int("MUSICLIGHT_PORT", 8000))
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", help="Do not send commands to physical lamps.")
+    mode.add_argument(
+        "--dry-run", action="store_true", help="Do not send commands to physical lamps."
+    )
     mode.add_argument("--live", action="store_true", help="Send commands to physical lamps.")
     return parser.parse_args(argv)
 
