@@ -226,11 +226,34 @@ const setLampIncluded = (lampId, included) => {
 	render();
 };
 
-const updateLampColor = (lampId, color) => {
+const syncLampColorDom = (lampId, color) => {
+	document.querySelectorAll("[data-lamp-color]").forEach((input) => {
+		if (input.dataset.lampColor === lampId && input.value !== color) {
+			input.value = color;
+		}
+	});
+	document.querySelectorAll("[data-lamp]").forEach((button) => {
+		if (button.dataset.lamp !== lampId) return;
+		button.style.setProperty("--lamp-color", color);
+		button.classList.toggle("off", color === "#000000");
+	});
+	document.querySelectorAll("[data-select-lamp]").forEach((row) => {
+		row.classList.toggle("selected", row.dataset.selectLamp === lampId);
+	});
+	document.querySelectorAll("[data-lamp]").forEach((button) => {
+		button.classList.toggle("selected", button.dataset.lamp === lampId);
+	});
+};
+
+const updateLampColor = (lampId, color, shouldRender = false) => {
 	if (!state.draft) return;
 	state.draft.colors = { ...(state.draft.colors || {}), [lampId]: color };
 	state.selectedLampId = lampId;
-	render();
+	if (shouldRender) {
+		render();
+	} else {
+		syncLampColorDom(lampId, color);
+	}
 };
 
 const fillAll = () => {
@@ -633,7 +656,13 @@ const renderApp = () => {
 	});
 	app.querySelectorAll("[data-lamp-color]").forEach((input) => {
 		input.addEventListener("click", (event) => event.stopPropagation());
+		input.addEventListener("pointerdown", (event) =>
+			event.stopPropagation(),
+		);
 		input.addEventListener("input", () =>
+			updateLampColor(input.dataset.lampColor, input.value),
+		);
+		input.addEventListener("change", () =>
 			updateLampColor(input.dataset.lampColor, input.value),
 		);
 	});
