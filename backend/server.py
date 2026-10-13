@@ -5,20 +5,20 @@ import json
 import mimetypes
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import RLock, Thread
 from urllib.parse import unquote, urlparse
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import FRONTEND_DIR, env_bool, env_int, load_dotenv
-from lamp_runtime import LampRuntime
-from security import AuthManager
-from storage import PresetStore, ValidationError
+from backend.config import FRONTEND_DIR, env_bool, env_int, load_dotenv
+from backend.lamp_runtime import LampRuntime
+from backend.security import AuthManager
+from backend.storage import PresetStore, ValidationError, normalize_brightness
 
 
 class HttpError(Exception):
@@ -33,6 +33,7 @@ class AppContext:
     store: PresetStore
     auth: AuthManager
     lamps: LampRuntime
+    command_lock: RLock = field(default_factory=RLock)
 
 
 class MusicLightServer(ThreadingHTTPServer):
@@ -72,17 +73,22 @@ class MusicLightHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             if path.startswith("/api/"):
-                self._handle_api(path)
+                if self.command in {"POST", "PUT", "DELETE"}:
+                    with self.server.context.command_lock:
+                        self._handle_api(path)
+                else:
+                    self._handle_api(path)
             else:
                 self._serve_static(path)
         except HttpError as exc:
             self._send_json(exc.status, {"error": exc.message})
         except ValidationError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Некорректный JSON"})
         except Exception as exc:
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            self.log_error("Request failed: %s", exc)
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Внутренняя ошибка сервера"})
 
     def _handle_api(self, path: str):
         method = self.command.upper()
@@ -113,6 +119,14 @@ class MusicLightHandler(BaseHTTPRequestHandler):
 
         if method == "POST" and path == "/api/apply":
             self._apply_preset(role)
+            return
+
+        if method == "POST" and path == "/api/off":
+            result = self.server.context.lamps.turn_off(self.server.context.store.list_lamps())
+            if result.get("ok"):
+                self.server.context.store.set_current_preset(None, result)
+            self._send_json(HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_GATEWAY,
+                            {**self._state_payload(role), "apply_result": result})
             return
 
         if method == "POST" and path == "/api/diagnostics":
@@ -182,6 +196,8 @@ class MusicLightHandler(BaseHTTPRequestHandler):
         if not preset:
             raise HttpError(HTTPStatus.NOT_FOUND, "Пресет не найден")
 
+        if "brightness" in body:
+            preset = {**preset, "brightness": normalize_brightness(body["brightness"])}
         lamps = self.server.context.store.list_lamps()
         result = self.server.context.lamps.apply_preset(preset, lamps)
         if result.get("ok"):
@@ -205,7 +221,12 @@ class MusicLightHandler(BaseHTTPRequestHandler):
         }
 
     def _read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            raise HttpError(HTTPStatus.BAD_REQUEST, "Некорректная длина запроса")
+        if length < 0 or self.headers.get("Transfer-Encoding"):
+            raise HttpError(HTTPStatus.BAD_REQUEST, "Некорректная длина запроса")
         if length > 1_000_000:
             raise HttpError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Слишком большой запрос")
         if length == 0:
@@ -331,6 +352,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
+        context.lamps.stop_animation()
         server.server_close()
 
 

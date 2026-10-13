@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 
 import numpy as np
 import soundcard as sc
@@ -8,8 +9,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from core.const import DEVICE_IP, LAMP_POSITION
 from libs.controller import TuyaLampController
 from libs.lerp_color import lerp, lerp_color
-from model import level as lvl
-from model.audio import FRAME_SIZE, SAMPLE_RATE, SPECTRUM_BINS, lamp_level, spectrum
+from model.audio import SPECTRUM_BINS, lamp_level
+from model.audio_stream import AudioCaptureWorker
 from model.color import clamp, color_to_hex
 from model.lamp_layout import build_lamp_positions
 from model.settings import load_settings, normalize_profile, save_settings
@@ -28,13 +29,21 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.resize(1180, 780)
 
         self.settings = load_settings()
+        self.last_audio_error = ""
         self.mic_devices = self.get_microphones()
-        self.beat_detector = lvl.BeatOnsetDetector(samplerate=SAMPLE_RATE)
+        self.audio_worker = None
+        self.last_frame_time = None
         self.selected_mic = None
         self.active_mic_name = ""
         self.pending_lamp_update = None
-        self.pending_mode_update = None
-        self.last_audio_error = ""
+        self.inflight_colors = {}
+        self.inflight_brightness = 1.0
+        self.inflight_music = True
+        self.queued_colors = {}
+        self.queued_brightness = 1.0
+        self.queued_music = True
+        self.last_lamp_send = 0.0
+        self._closing = False
 
         self.device_ids = [device.id for device in (tuya_controller.devices if tuya_controller else [])]
         if not self.device_ids:
@@ -61,12 +70,17 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.beat_decay = float(self.settings["beat_decay"])
         self.beat_response_level = 0.0
         self.color_profiles = list(self.settings.get("color_profiles") or [])
-        self.beat_history = []
         self.mode = self.settings["mode"]
 
         self.timer = QtCore.QTimer(self)
-        self.timer.setInterval(50)
+        self.timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.timer.setInterval(33)
         self.timer.timeout.connect(self.update_visualization)
+
+        self.lamp_timer = QtCore.QTimer(self)
+        self.lamp_timer.setInterval(200)
+        self.lamp_timer.timeout.connect(self.flush_lamp_updates)
+        self.lamp_timer.start()
 
         self.diagnosticsReady.connect(self.render_diagnostics)
         self.init_ui()
@@ -500,18 +514,30 @@ class AudioVisualizer(QtWidgets.QWidget):
             self.active_lamps.add(lamp_id)
         else:
             self.active_lamps.discard(lamp_id)
+            self.send_colors({lamp_id: (0, 0, 0)}, 0.0)
         self.sync_lamp_controls()
+        if self.mode == "static" and enabled:
+            self.apply_static_color()
 
     def select_lamps(self, enabled):
+        if not enabled:
+            self.send_colors({lamp_id: (0, 0, 0) for lamp_id in self.active_lamps}, 0.0)
         self.active_lamps = set(self.device_ids) if enabled else set()
         self.sync_lamp_controls()
+        if enabled and self.mode == "static":
+            self.apply_static_color()
 
     def on_mode_changed(self):
         self.mode = self.mode_combo.currentData()
-        if self.tuya_controller and self.active_lamps and self.async_loop and self.timer.isActive():
-            self.pending_mode_update = asyncio.run_coroutine_threadsafe(
-                self.tuya_controller.set_mode("music", self.active_lamps), self.async_loop
-            )
+        self.beat_response_level = 0.0
+        self.last_frame_time = None
+        if not self.timer.isActive():
+            return
+        if self.mode == "static":
+            self.stop_audio_capture()
+            self.apply_static_color()
+        else:
+            self.ensure_audio_capture()
 
     def on_source_changed(self):
         if not self.timer.isActive() or not self.mic_devices:
@@ -521,6 +547,9 @@ class AudioVisualizer(QtWidgets.QWidget):
         if 0 <= index < len(self.mic_devices):
             self.selected_mic = self.mic_devices[index]
             self.active_mic_name = self.selected_mic.name
+            self.beat_response_level = 0.0
+            self.last_frame_time = None
+            self.ensure_audio_capture()
             self.refresh_device_labels()
             self.settings_status.setText(f"Источник: {self.active_mic_name}")
 
@@ -542,7 +571,6 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.beat_decay_label.setText(f"{value}%")
 
     def clear_beat_graph(self):
-        self.beat_history = []
         self.beat_graph_widget.clear()
         self.beat_percent_label.setText("Бит: 0%")
 
@@ -824,21 +852,27 @@ class AudioVisualizer(QtWidgets.QWidget):
         if self.min_brightness > self.max_brightness:
             self.max_brightness_spin.setValue(self.min_brightness)
             self.max_brightness = self.min_brightness
+        if self.mode == "static":
+            self.apply_static_color()
 
     def start_stream(self):
-        if not self.mic_devices:
+        if self.timer.isActive() or self._closing:
+            return
+        if self.mode != "static" and not self.mic_devices:
             QtWidgets.QMessageBox.warning(self, "Аудио", "Аудиоустройства не найдены")
             return
 
         idx = self.device_combo.currentIndex()
-        if idx < 0:
+        if self.mode != "static" and idx < 0:
             QtWidgets.QMessageBox.warning(self, "Аудио", "Выберите источник аудио")
             return
 
-        self.selected_mic = self.mic_devices[idx]
-        self.active_mic_name = self.selected_mic.name
+        self.selected_mic = self.mic_devices[idx] if 0 <= idx < len(self.mic_devices) else None
+        self.active_mic_name = self.selected_mic.name if self.selected_mic else ""
         self.beat_response_level = 0.0
-        self.beat_detector = lvl.BeatOnsetDetector(samplerate=SAMPLE_RATE)
+        self.last_frame_time = None
+        self.smooth_levels = dict.fromkeys(self.lamp_positions, 0.0)
+        self.clear_beat_graph()
         self.refresh_device_labels()
         self.timer.start()
         self.start_btn.setEnabled(False)
@@ -848,9 +882,12 @@ class AudioVisualizer(QtWidgets.QWidget):
 
     def stop_stream(self, send_to_lamps=True):
         self.timer.stop()
+        self.stop_audio_capture()
         self.selected_mic = None
         self.active_mic_name = ""
         self.beat_response_level = 0.0
+        self.last_frame_time = None
+        self.smooth_levels = dict.fromkeys(self.lamp_positions, 0.0)
         self.refresh_device_labels()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -867,9 +904,10 @@ class AudioVisualizer(QtWidgets.QWidget):
         color = tuple(int(channel * brightness) for channel in self.static_color)
         colors = {lamp_id: color for lamp_id in self.active_lamps}
         self.update_preview(colors, np.zeros(SPECTRUM_BINS), 1.0, color)
-        self.send_colors(colors, brightness)
+        self.send_colors(colors, brightness, music=False)
 
     def turn_off_all_lamps(self):
+        self.stop_stream(send_to_lamps=False)
         colors = {lamp_id: (0, 0, 0) for lamp_id in self.device_ids}
         self.update_beat_graph(0.0)
         self.update_preview(colors, np.zeros(SPECTRUM_BINS), 0.0, (0, 0, 0))
@@ -879,15 +917,17 @@ class AudioVisualizer(QtWidgets.QWidget):
     def update_visualization(self):
         mode = self.mode_combo.currentData()
         if mode == "static":
-            self.apply_static_color()
             return
 
-        data = self.read_audio()
-        bars = spectrum(data) if data is not None else np.zeros(SPECTRUM_BINS)
-        raw_rms_level = self.beat_detector(data) if data is not None else 0.0
+        frame = self.audio_worker.take_frame() if self.audio_worker else None
+        if frame is None:
+            return
+        bars, raw_rms_level, onset, timestamp = frame
+        dt = timestamp - self.last_frame_time if self.last_frame_time is not None else self.timer.interval() / 1000
+        self.last_frame_time = timestamp
         raw_spectrum_level = float(np.max(bars)) if len(bars) else 0.0
         bars = np.clip(bars * self.beat_scale, 0.0, 1.0)
-        rms_level = self.filtered_beat_level(raw_rms_level * self.beat_scale)
+        rms_level = self.filtered_beat_level(raw_rms_level * self.beat_scale, dt)
         spectrum_level = clamp(raw_spectrum_level * self.beat_scale)
         visual_level = clamp(spectrum_level if mode == "spectrum" else rms_level)
 
@@ -903,7 +943,8 @@ class AudioVisualizer(QtWidgets.QWidget):
 
             level = lamp_level(mode, position, rms_level, bars)
             previous = self.smooth_levels.get(lamp_id, 0.0)
-            smooth = previous + self.smoothing_factor * (level - previous)
+            smoothing = 1.0 - (1.0 - self.smoothing_factor) ** (dt / 0.05)
+            smooth = previous + smoothing * (level - previous)
             self.smooth_levels[lamp_id] = smooth
 
             base_color = self.color_for_level(smooth)
@@ -916,13 +957,13 @@ class AudioVisualizer(QtWidgets.QWidget):
             final_colors[lamp_id] = color
             display_colors[lamp_id] = color
 
-        self.update_beat_graph(visual_level)
+        self.update_beat_graph(rms_level, raw_rms_level * self.beat_scale, onset, timestamp)
         self.update_preview(display_colors, bars, visual_level, current_color)
         self.send_colors(final_colors, global_brightness)
 
-    def filtered_beat_level(self, raw_level):
+    def filtered_beat_level(self, raw_level, dt=0.05):
         raw_level = clamp(raw_level)
-        decayed_level = max(0.0, self.beat_response_level - self.beat_decay)
+        decayed_level = max(0.0, self.beat_response_level - self.beat_decay * dt / 0.05)
         if raw_level < self.beat_threshold:
             self.beat_response_level = decayed_level
         else:
@@ -964,13 +1005,34 @@ class AudioVisualizer(QtWidgets.QWidget):
             return "средний"
         return "тихий"
 
-    def read_audio(self):
-        try:
-            return self.selected_mic.record(numframes=FRAME_SIZE, samplerate=SAMPLE_RATE)
-        except Exception as exc:
-            self.last_audio_error = str(exc)
-            self.settings_status.setText(f"Аудио: {exc}")
-            return None
+    def ensure_audio_capture(self):
+        if self.mode == "static" or not self.timer.isActive() or not self.selected_mic:
+            return
+        if self.audio_worker:
+            if self.audio_worker.microphone is not self.selected_mic:
+                self.audio_worker.requestInterruption()
+            return
+        self.audio_worker = AudioCaptureWorker(self.selected_mic, self)
+        self.audio_worker.failed.connect(self.on_audio_error)
+        self.audio_worker.finished.connect(self.on_audio_worker_finished)
+        self.audio_worker.start()
+
+    def stop_audio_capture(self):
+        if self.audio_worker:
+            self.audio_worker.requestInterruption()
+
+    def on_audio_worker_finished(self):
+        worker = self.sender()
+        if worker is self.audio_worker:
+            self.audio_worker = None
+            self.last_frame_time = None
+        worker.deleteLater()
+        self.ensure_audio_capture()
+
+    def on_audio_error(self, error):
+        self.last_audio_error = error
+        self.stop_stream()
+        self.settings_status.setText(f"Аудио: {error}")
 
     def update_preview(self, colors, bars, level, current_color):
         self.lamp_widget.set_lamp_colors(colors)
@@ -982,21 +1044,51 @@ class AudioVisualizer(QtWidgets.QWidget):
             f"Уровень: {int(level * 100)}% · {self.beat_tier(level)} · {color_to_hex(current_color).upper()}"
         )
 
-    def update_beat_graph(self, level):
+    def update_beat_graph(self, level, raw_level=None, onset=False, timestamp=None):
         level = clamp(level)
-        self.beat_history.append(level)
-        if len(self.beat_history) > self.beat_graph_widget.max_points:
-            self.beat_history = self.beat_history[-self.beat_graph_widget.max_points :]
-        self.beat_graph_widget.add_level(level)
+        self.beat_graph_widget.add_level(level, raw_level, onset, timestamp)
         self.beat_percent_label.setText(f"Бит: {int(level * 100)}% · {self.beat_tier(level)}")
 
-    def send_colors(self, colors, brightness):
-        if not self.tuya_controller or not colors or not self.async_loop:
+    def send_colors(self, colors, brightness, *, music=True):
+        if not self.tuya_controller or not colors or not self.async_loop or not self.async_loop.is_running():
             return
+        # Keep the latest requested state of each lamp, including an explicit off.
+        self.queued_colors.update(colors)
+        self.queued_brightness = brightness
+        self.queued_music = music
+        self.flush_lamp_updates()
+
+    def flush_lamp_updates(self):
         if self.pending_lamp_update and not self.pending_lamp_update.done():
             return
+        if self.pending_lamp_update:
+            try:
+                errors = self.pending_lamp_update.result()
+                if errors:
+                    self.settings_status.setText(f"Лампы: {next(iter(errors.values()))}")
+                    if not self._closing:
+                        had_new_updates = bool(self.queued_colors)
+                        for lamp_id in errors:
+                            if lamp_id in self.inflight_colors:
+                                self.queued_colors.setdefault(lamp_id, self.inflight_colors[lamp_id])
+                        if not had_new_updates:
+                            self.queued_brightness = self.inflight_brightness
+                            self.queued_music = self.inflight_music
+            except Exception as exc:
+                self.settings_status.setText(f"Лампы: {exc}")
+            self.pending_lamp_update = None
+        if not self.queued_colors or time.monotonic() - self.last_lamp_send < 0.2:
+            return
+        colors, self.queued_colors = self.queued_colors, {}
+        # RGB values already carry brightness; a zero-brightness update for one
+        # disabled lamp must not turn off the other lamps sharing this batch.
+        brightness = self.queued_brightness if self.queued_brightness > 0 else 1.0
+        self.inflight_colors = dict(colors)
+        self.inflight_brightness = brightness
+        self.inflight_music = self.queued_music
+        self.last_lamp_send = time.monotonic()
         self.pending_lamp_update = asyncio.run_coroutine_threadsafe(
-            self.tuya_controller.set_colors(colors, brightness), self.async_loop
+            self.tuya_controller.set_colors(colors, brightness, music=self.queued_music), self.async_loop
         )
 
     def refresh_diagnostics(self):
@@ -1083,6 +1175,16 @@ class AudioVisualizer(QtWidgets.QWidget):
         return text if len(text) <= 180 else text[:177] + "..."
 
     def closeEvent(self, event):
-        self.save_current_settings()
-        self.stop_stream(send_to_lamps=self.timer.isActive())
+        if not self._closing:
+            self._closing = True
+            self.setEnabled(False)
+            self.save_current_settings()
+            self.stop_stream(send_to_lamps=self.timer.isActive())
+        self.flush_lamp_updates()
+        if ((self.audio_worker and self.audio_worker.isRunning()) or self.queued_colors
+                or (self.pending_lamp_update and not self.pending_lamp_update.done())):
+            event.ignore()
+            QtCore.QTimer.singleShot(50, self.close)
+            return
+        self.lamp_timer.stop()
         event.accept()

@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-from config import LAMP_CONFIG_PATH, data_dir
+from backend.config import LAMP_CONFIG_PATH, data_dir
 
 HEX_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
@@ -65,7 +65,10 @@ def normalize_hex(value: Any) -> str:
 
 def normalize_brightness(value: Any) -> int:
     try:
-        return int(clamp(float(value), 0, 100))
+        number = float(value)
+        if isinstance(value, bool) or not math.isfinite(number) or not 0 <= number <= 100:
+            raise ValueError
+        return int(number)
     except (TypeError, ValueError):
         raise ValidationError("Некорректная яркость")
 
@@ -112,22 +115,22 @@ def load_lamps(path: Path = LAMP_CONFIG_PATH) -> list[dict[str, Any]]:
 
 
 class PresetStore:
-    def __init__(self, presets_path: Path | None = None, state_path: Path | None = None):
+    def __init__(self, presets_path: Path | None = None, state_path: Path | None = None,
+                 lamp_config_path: Path = LAMP_CONFIG_PATH):
         base_dir = data_dir()
         self.presets_path = presets_path or (base_dir / "presets.json")
         self.state_path = state_path or (base_dir / "state.json")
+        self.lamp_config_path = lamp_config_path
         self._lock = RLock()
 
     def list_lamps(self) -> list[dict[str, Any]]:
-        return load_lamps()
+        return load_lamps(self.lamp_config_path)
 
     def list_presets(self) -> list[dict[str, Any]]:
         with self._lock:
             data = self._read_presets_locked()
             lamps = self.list_lamps()
             presets = [self._normalize_preset(preset, lamps) for preset in data.get("presets", [])]
-            data["presets"] = presets
-            write_json(self.presets_path, data)
             return presets
 
     def get_preset(self, preset_id: str) -> dict[str, Any] | None:
@@ -137,7 +140,7 @@ class PresetStore:
         with self._lock:
             data = self._read_presets_locked()
             lamps = self.list_lamps()
-            preset = self._normalize_preset(payload, lamps, is_new=True)
+            preset = self._normalize_preset({**payload, "id": str(uuid.uuid4())}, lamps, is_new=True)
             data.setdefault("presets", []).insert(0, preset)
             write_json(self.presets_path, data)
             return preset
@@ -228,8 +231,12 @@ class PresetStore:
         data = read_json(self.presets_path, {"version": 1, "presets": []})
         if not isinstance(data.get("presets"), list):
             data["presets"] = []
-        if not data["presets"]:
-            data["presets"] = self._default_presets(self.list_lamps())
+        # Seed once, including existing installations, without recreating deleted scenes.
+        if data.get("library_version", 0) < 2 and self.list_lamps():
+            existing_names = {preset.get("name") for preset in data["presets"]}
+            data["presets"].extend(preset for preset in self._default_presets(self.list_lamps())
+                                   if preset["name"] not in existing_names)
+            data["library_version"] = 2
             write_json(self.presets_path, data)
         return data
 
@@ -267,7 +274,16 @@ class PresetStore:
 
         effect = str(payload.get("effect") or "static").strip().lower()
         if effect not in {"static", "fire", "pulse", "wave"}:
-            effect = "static"
+            raise ValidationError("Неизвестный эффект")
+        white_mode = payload.get("white_mode", "auto")
+        if white_mode not in {"auto", "rgb"}:
+            raise ValidationError("Неизвестный режим белого")
+        try:
+            speed = float(payload.get("speed", 1))
+            if not math.isfinite(speed) or not 0.25 <= speed <= 3:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValidationError("Скорость должна быть от 0.25 до 3")
 
         return {
             "id": str(payload.get("id") or uuid.uuid4()),
@@ -275,57 +291,28 @@ class PresetStore:
             "description": str(payload.get("description") or "").strip()[:240],
             "brightness": normalize_brightness(payload.get("brightness", 100)),
             "effect": effect,
+            "speed": speed,
+            "white_mode": white_mode,
+            "white_temperature": normalize_brightness(payload.get("white_temperature", 50)),
             "colors": colors,
             "created_at": str(payload.get("created_at") or now),
             "updated_at": now if is_new else str(payload.get("updated_at") or now),
         }
 
     def _default_presets(self, lamps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not lamps:
-            return []
-
-        def filled(color: str) -> dict[str, str]:
-            return {lamp["id"]: color for lamp in lamps}
-
-        warm = filled("#ff9f43")
-        night = filled("#2446ff")
-        fire_palette = ["#ff3b1f", "#ff6f1f", "#ffb000", "#ff4d00", "#ffd166"]
-        fire = {
-            lamp["id"]: fire_palette[index % len(fire_palette)] for index, lamp in enumerate(lamps)
-        }
-
-        return [
-            self._normalize_preset(
-                {
-                    "name": "Теплый свет",
-                    "description": "",
-                    "brightness": 75,
-                    "effect": "static",
-                    "colors": warm,
-                },
-                lamps,
-                is_new=True,
-            ),
-            self._normalize_preset(
-                {
-                    "name": "Огонь",
-                    "description": "",
-                    "brightness": 90,
-                    "effect": "fire",
-                    "colors": fire,
-                },
-                lamps,
-                is_new=True,
-            ),
-            self._normalize_preset(
-                {
-                    "name": "Ночной",
-                    "description": "",
-                    "brightness": 35,
-                    "effect": "static",
-                    "colors": night,
-                },
-                lamps,
-                is_new=True,
-            ),
+        scenes = [
+            ("?????? ?????", "??????????? ???? ??? ???????????? ???", 100, "static", ["#ffffff"], 50, 1),
+            ("??? ??????", "???????? ????? ??? ????????????", 90, "static", ["#ffffff"], 85, 1),
+            ("?????? ????", "?????? ????? ??? ??????? ??????", 65, "static", ["#ffffff"], 0, 1),
+            ("?????", "??????????, ???????? ? ??????? ???????", 70, "wave", ["#ff7849", "#ffbb65", "#ff456c"], 50, 0.5),
+            ("?????", "????????? ????? ?? ?????? ?? ????????? ??????", 70, "wave", ["#16d9d0", "#249bff", "#3455ff"], 50, 0.5),
+            ("???", "????????? ??????? ???????", 55, "pulse", ["#62d68c", "#24a88a", "#b4d96c"], 50, 0.35),
+            ("?????", "????? ???????? ?????? ?????", 85, "fire", ["#ff3b1f", "#ff8c20", "#ffd166"], 0, 1),
+            ("????", "??????????? ????? ??? ?????????", 90, "pulse", ["#fe3ea5", "#614bff", "#21e5ef"], 50, 1.5),
+            ("??????", "???????????? ?????? ????", 12, "static", ["#ffffff"], 0, 1),
         ]
+        return [self._normalize_preset({
+            "name": name, "description": description, "brightness": brightness,
+            "effect": effect, "white_temperature": temperature, "speed": speed,
+            "colors": {lamp["id"]: palette[index % len(palette)] for index, lamp in enumerate(lamps)},
+        }, lamps, is_new=True) for name, description, brightness, effect, palette, temperature, speed in scenes]

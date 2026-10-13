@@ -32,7 +32,7 @@ class AuthManager:
         expected = self.admin_password if role == "admin" else self.user_password if role == "user" else None
         if expected is None:
             return None
-        if not hmac.compare_digest(str(password), expected):
+        if not hmac.compare_digest(str(password).encode("utf-8"), expected.encode("utf-8")):
             return None
 
         token = secrets.token_urlsafe(32)

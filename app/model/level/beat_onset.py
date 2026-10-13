@@ -1,140 +1,108 @@
 from collections import deque
+from functools import lru_cache
+import math
 
 import numpy as np
 
+from model.audio import audio_features
+
+
+@lru_cache(maxsize=8)
+def frequency_bands(size, samplerate):
+    frequencies = np.fft.rfftfreq(size, 1.0 / samplerate)
+    return tuple((frequencies >= low) & (frequencies < high)
+                 for low, high in ((35, 180), (180, 2000), (2000, 10000)))
+
 
 class BeatOnsetDetector:
-    """Adaptive onset detector for real-time beat-like impulses.
+    """Adaptive percussive onset detector with an audio-time refractory period.
 
-    The detector is stateful: call it once per audio frame. It combines spectral
-    flux, low-frequency energy changes and RMS gating, then adapts its threshold
-    to the recent history. The return value is a visual control level in 0..1.
+    Returns a decaying pulse in 0..1. ``last_onset`` marks actual attacks;
+    sustained tones and the refractory period cannot retrigger the envelope.
     """
 
-    def __init__(
-        self,
-        samplerate=44100,
-        history_size=48,
-        min_rms=0.006,
-        decay=0.72,
-        cooldown_frames=2,
-        warmup_frames=6,
-    ):
+    def __init__(self, samplerate=44100, history_size=96, min_rms=0.0015,
+                 decay=0.72, cooldown_frames=3, warmup_frames=3):
         self.samplerate = samplerate
         self.history = deque(maxlen=history_size)
-        self.prev_mag = None
-        self.prev_low_energy = 0.0
-        self.prev_mid_energy = 0.0
-        self.energy_peak = 1e-6
-        self.output = 0.0
-        self.cooldown = 0
-        self.frames_seen = 0
+        self.band_history = deque(maxlen=history_size)
         self.min_rms = min_rms
-        self.decay = decay
-        self.cooldown_frames = cooldown_frames
-        self.warmup_frames = warmup_frames
+        # Keep the old options in units of the former 50 ms frames.
+        self.release_seconds = -0.05 / math.log(max(0.01, min(0.99, decay)))
+        self.refractory_seconds = max(0.10, cooldown_frames * 0.05)
+        self.warmup_seconds = warmup_frames * 0.05
+        self.reset()
 
     def reset(self):
         self.history.clear()
+        self.band_history.clear()
         self.prev_mag = None
-        self.prev_low_energy = 0.0
-        self.prev_mid_energy = 0.0
-        self.energy_peak = 1e-6
+        self.prev_rms = 0.0
+        self.prev_band_energy = np.zeros(3)
         self.output = 0.0
-        self.cooldown = 0
-        self.frames_seen = 0
+        self.cooldown = 0.0
+        self.elapsed = 0.0
+        self.last_onset = False
 
-    def __call__(self, data):
-        y = np.asarray(data, dtype=np.float32)
-        if y.ndim > 1:
-            y = np.mean(y, axis=1)
-        if y.size < 16:
+    def __call__(self, data, *, magnitude=None, rms=None):
+        size = np.asarray(data).shape[0] if np.asarray(data).ndim else 0
+        self.last_onset = False
+        if size < 16:
             return 0.0
+        if magnitude is None or rms is None:
+            magnitude, rms = audio_features(data)
+        dt = size / self.samplerate
+        self.elapsed += dt
+        self.cooldown = max(0.0, self.cooldown - dt)
+        self.output *= math.exp(-dt / self.release_seconds)
 
-        y = y - np.mean(y)
-        rms = float(np.sqrt(np.mean(np.square(y))))
-        self.frames_seen += 1
-
-        window = np.hanning(y.size).astype(np.float32)
-        mag = np.abs(np.fft.rfft(y * window))
-        freqs = np.fft.rfftfreq(y.size, 1.0 / self.samplerate)
-        total_energy = float(np.sum(mag) + 1e-9)
-
-        low_energy = self._band_energy(mag, freqs, 35, 180)
-        mid_energy = self._band_energy(mag, freqs, 180, 4500)
+        bands = frequency_bands(size, self.samplerate)
+        energies = np.array([float(np.sum(magnitude[mask])) for mask in bands])
+        novelty = 0.0
+        attack = False
+        if self.prev_mag is not None and self.prev_mag.shape == magnitude.shape:
+            # Normalise each band independently so bass is not buried by vocals.
+            positive = np.maximum(magnitude - self.prev_mag, 0.0)
+            flux = np.array([float(np.sum(positive[mask])) for mask in bands])
+            flux /= np.maximum(np.maximum(energies, self.prev_band_energy), 1e-6)
+            energy_jump = np.maximum(energies - self.prev_band_energy, 0.0)
+            energy_jump /= np.maximum(np.maximum(energies, self.prev_band_energy), 1e-6)
+            rms_jump = max(0.0, rms - self.prev_rms) / max(rms, self.prev_rms, 1e-6)
+            novelty = float(np.dot(0.65 * flux + 0.35 * energy_jump, (0.55, 0.30, 0.15)))
+            # Phase changes in stationary low tones must not count as attacks.
+            novelty *= min(1.0, rms_jump / 0.08)
+            attack = rms_jump >= 0.12
+            if len(self.band_history) >= 8:
+                past = np.asarray(self.band_history)
+                band_baseline = np.median(past, axis=0)
+                band_spread = 1.4826 * np.median(np.abs(past - band_baseline), axis=0)
+                strong_band = (energies > band_baseline + 6.0 * band_spread)
+                strong_band &= energies > np.maximum(band_baseline * 3.0, 1e-5)
+                attack = attack or bool(np.any(strong_band & (energy_jump > 0.55)))
 
         if rms < self.min_rms:
-            self.history.append(0.0)
-            self.prev_mag = mag
-            self.prev_low_energy = low_energy
-            self.prev_mid_energy = mid_energy
-            self.output *= self.decay
-            self._tick_cooldown()
-            return float(np.clip(self.output, 0.0, 1.0))
-
-        if self.prev_mag is None or self.prev_mag.shape != mag.shape:
-            flux = 0.0
-            low_jump = 0.0
-            mid_jump = 0.0
-        else:
-            diff = mag - self.prev_mag
-            flux = float(np.sum(diff[diff > 0]) / total_energy)
-            low_jump = max(0.0, low_energy - self.prev_low_energy) / max(low_energy, self.prev_low_energy, 1e-9)
-            mid_jump = max(0.0, mid_energy - self.prev_mid_energy) / max(mid_energy, self.prev_mid_energy, 1e-9)
-        rms_norm = self._rms_level(rms)
-
-        novelty = (0.55 * flux) + (0.30 * low_jump) + (0.15 * mid_jump)
-        novelty *= 0.65 + 0.70 * rms_norm
-        novelty = float(np.clip(novelty, 0.0, 4.0))
-
-        self.history.append(novelty)
-        if self.frames_seen <= self.warmup_frames:
-            self.prev_mag = mag
-            self.prev_low_energy = low_energy
-            self.prev_mid_energy = mid_energy
-            return 0.0
-
+            novelty = 0.0
         baseline, spread = self._adaptive_stats()
-        onset = max(0.0, novelty - baseline)
-        onset_score = onset / max(spread * 1.6, 0.035)
-        onset_score = float(np.clip(onset_score, 0.0, 1.0))
+        threshold = max(0.12, baseline + max(0.08, 2.5 * spread))
+        if (self.elapsed >= self.warmup_seconds and self.cooldown == 0.0
+                and attack and rms >= self.min_rms and novelty > threshold):
+            strength = float(np.clip((novelty - baseline) / max(0.35, threshold - baseline), 0.0, 1.0))
+            self.output = max(self.output, strength)
+            self.cooldown = self.refractory_seconds
+            self.last_onset = True
 
-        is_onset = onset_score > 0.28 and self.cooldown == 0
-        if is_onset:
-            self.output = max(self.output, onset_score)
-            self.cooldown = self.cooldown_frames
-        else:
-            self.output *= self.decay
-            if onset_score > self.output:
-                self.output = 0.35 * self.output + 0.65 * onset_score
-            self._tick_cooldown()
-
-        self.prev_mag = mag
-        self.prev_low_energy = low_energy
-        self.prev_mid_energy = mid_energy
+        # Compare to past frames before adding this attack to the baseline.
+        self.history.append(novelty)
+        self.band_history.append(energies)
+        self.prev_mag = magnitude
+        self.prev_rms = rms
+        self.prev_band_energy = energies
         return float(np.clip(self.output, 0.0, 1.0))
 
     def _adaptive_stats(self):
         if len(self.history) < 8:
-            return 0.0, 0.12
-
-        values = np.asarray(self.history, dtype=np.float32)
+            return 0.0, 0.0
+        values = np.asarray(self.history)
         baseline = float(np.median(values))
-        high = float(np.percentile(values, 88))
-        spread = max(high - baseline, float(np.std(values)), 0.025)
+        spread = float(np.median(np.abs(values - baseline))) * 1.4826
         return baseline, spread
-
-    def _rms_level(self, rms):
-        self.energy_peak = max(self.energy_peak * 0.995, rms, 1e-6)
-        return float(np.clip(rms / self.energy_peak, 0.0, 1.0))
-
-    def _tick_cooldown(self):
-        if self.cooldown > 0:
-            self.cooldown -= 1
-
-    @staticmethod
-    def _band_energy(mag, freqs, low, high):
-        mask = (freqs >= low) & (freqs < high)
-        if not np.any(mask):
-            return 0.0
-        return float(np.sum(mag[mask]))

@@ -8,7 +8,7 @@ import time
 from threading import Event, RLock, Thread
 from typing import Any
 
-from config import APP_DIR
+from backend.config import APP_DIR
 
 
 def hex_to_rgb(value: str) -> tuple[int, int, int]:
@@ -35,6 +35,7 @@ class LampRuntime:
         self._animation_stop: Event | None = None
         self._animation_thread: Thread | None = None
         self._animation_effect = ""
+        self._animation_error = ""
 
     def status(self) -> dict[str, Any]:
         return {
@@ -44,11 +45,21 @@ class LampRuntime:
             "animation": {
                 "running": bool(self._animation_thread and self._animation_thread.is_alive()),
                 "effect": self._animation_effect,
+                "error": self._animation_error,
             },
         }
 
     def apply_preset(self, preset: dict[str, Any], lamps: list[dict[str, Any]]) -> dict[str, Any]:
+        with self._lock:
+            return self._apply_preset_locked(preset, lamps)
+
+    def turn_off(self, lamps: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.apply_preset({"colors": {lamp["id"]: "#000000" for lamp in lamps},
+                                  "brightness": 0, "effect": "static"}, lamps)
+
+    def _apply_preset_locked(self, preset: dict[str, Any], lamps: list[dict[str, Any]]) -> dict[str, Any]:
         self.stop_animation()
+        self._animation_error = ""
         brightness_ratio = max(0.0, min(1.0, float(preset.get("brightness", 100)) / 100))
         enabled_lamp_ids = [lamp["id"] for lamp in lamps if lamp.get("enabled", True)]
         enabled_lamps = set(enabled_lamp_ids)
@@ -73,7 +84,7 @@ class LampRuntime:
         command_colors = {lamp_id: colors.get(lamp_id, (0, 0, 0)) for lamp_id in enabled_lamp_ids}
         off_lamp_count = len(command_colors) - len(colors)
         effect = str(preset.get("effect") or "static").lower()
-        if effect in {"fire", "pulse", "wave"}:
+        if brightness_ratio > 0 and effect in {"fire", "pulse", "wave"}:
             return self._apply_animated(
                 effect,
                 colors,
@@ -104,7 +115,7 @@ class LampRuntime:
         if stop_event:
             stop_event.set()
         if thread and thread.is_alive():
-            thread.join(timeout=2)
+            thread.join()
 
     def _send_colors(
         self,
@@ -144,7 +155,20 @@ class LampRuntime:
 
         try:
             with self._send_lock:
-                asyncio.run(controller.set_colors(colors, brightness_ratio))
+                asyncio.run(controller.set_colors(
+                    colors, brightness_ratio,
+                    music=preset.get("effect", "static") != "static",
+                    white_mode=preset.get("white_mode", "auto"),
+                    white_temperature=preset.get("white_temperature", 50),
+                ))
+                errors = [
+                    {"id": device.device.id, "error": device.last_error}
+                    for device in controller.async_devices
+                    if device.device.id in colors and getattr(device, "last_error", "")
+                ]
+                known_ids = {device.device.id for device in controller.async_devices}
+                errors.extend({"id": lamp_id, "error": "Лампа не инициализирована"}
+                              for lamp_id in colors if lamp_id not in known_ids)
         except Exception as exc:
             return {
                 "ok": False,
@@ -158,11 +182,6 @@ class LampRuntime:
                 "error": str(exc),
             }
 
-        errors = [
-            {"id": device.device.id, "error": device.last_error}
-            for device in controller.async_devices
-            if getattr(device, "last_error", "")
-        ]
         return {
             "ok": not errors,
             "dry_run": False,
@@ -196,7 +215,7 @@ class LampRuntime:
             active_lamp_count=active_lamp_count,
             off_lamp_count=off_lamp_count,
         )
-        result["animation"] = bool(result.get("ok"))
+        result["animation"] = bool(result.get("ok")) and not self.dry_run
         result["effect"] = effect
 
         if not result.get("ok") or self.dry_run:
@@ -236,15 +255,18 @@ class LampRuntime:
         started = time.perf_counter()
         interval = 0.18 if effect == "fire" else 0.24
         while not stop_event.wait(interval):
-            elapsed = time.perf_counter() - started
+            elapsed = (time.perf_counter() - started) * preset.get("speed", 1)
             frame = self._animation_frame(effect, base_colors, lamps, elapsed)
-            self._send_colors(
+            result = self._send_colors(
                 frame,
                 brightness_ratio,
                 preset,
                 active_lamp_count=active_lamp_count,
                 off_lamp_count=0,
             )
+            if not result.get("ok"):
+                self._animation_error = result.get("error", "Ошибка анимации")
+                break
 
     def _animation_frame(
         self,
@@ -337,7 +359,8 @@ class LampRuntime:
             }
 
         try:
-            raw_rows = asyncio.run(controller.diagnose_devices())
+            with self._send_lock:
+                raw_rows = asyncio.run(controller.diagnose_devices())
         except Exception as exc:
             rows = [
                 {

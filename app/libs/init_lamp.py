@@ -27,6 +27,8 @@ def init_lamp():
         device.set_version(float(lamp.get("version", "3.5")))
         device.set_bulb_type(str(lamp.get("bulb_type") or "B").upper(), mapping=bulb_mapping)
         device.set_socketPersistent(True)
+        device.set_socketTimeout(3)
+        device.set_socketRetryLimit(1)
         devices.append(device)
 
     return devices
