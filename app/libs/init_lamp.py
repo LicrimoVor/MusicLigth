@@ -2,7 +2,6 @@ import tinytuya
 
 from core.const import get_lamp_devices
 
-
 DEFAULT_BULB_MAPPING = {
     "value_min": 10,
     "value_max": 1000,
@@ -27,8 +26,11 @@ def init_lamp():
         device.set_version(float(lamp.get("version", "3.5")))
         device.set_bulb_type(str(lamp.get("bulb_type") or "B").upper(), mapping=bulb_mapping)
         device.set_socketPersistent(True)
+        device.set_socketNODELAY(True)
         device.set_socketTimeout(3)
-        device.set_socketRetryLimit(1)
+        # A null ACK is a valid response. Do not wait for a second response or
+        # replay a failed send; the controller already handles retry backoff.
+        # device.set_socketRetryLimit(0)
         devices.append(device)
 
     return devices

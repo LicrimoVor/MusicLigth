@@ -1,12 +1,14 @@
 import asyncio
 from pathlib import Path
 import sys
+import socket
+import struct
 import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
-from libs.controller import TuyaLampController
+from libs.controller import TuyaLampController, drain_responses
 
 
 class FakeBulb:
@@ -108,6 +110,66 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(asyncio.run, controller.set_colors({"lamp": (100, 20, 10)}, music=False))
         await asyncio.to_thread(asyncio.run, controller.set_colors({"lamp": (200, 20, 10)}, music=False))
         self.assertEqual(len(self.bulb.calls), 2)
+
+    async def test_music_stream_writes_without_waiting_for_acknowledgements(self):
+        self.controller.set_update_rate(20)
+        started = time.monotonic()
+        for value in range(10):
+            await self.controller.set_colors({"lamp": (50 + value * 15, 20, 10)},
+                                             white_mode="rgb", wait_for_response=False)
+        self.assertLess(time.monotonic() - started, 0.9)
+        self.assertEqual(len(self.bulb.calls), 11)
+        self.assertTrue(all(call[1][-1] is True for call in self.bulb.calls))
+        self.assertEqual(sum(call[0] == "set_mode" for call in self.bulb.calls), 1)
+        times = [call[2] for call in self.bulb.calls]
+        self.assertTrue(all(b - a >= 0.045 for a, b in zip(times, times[1:])), times)
+
+    async def test_stream_neutral_colors_stay_in_music_mode(self):
+        await self.controller.set_colors({"lamp": (100, 20, 10)}, white_mode="rgb", wait_for_response=False)
+        await self.controller.set_colors({"lamp": (100, 100, 100)}, white_mode="rgb", wait_for_response=False)
+        self.assertEqual([call[0] for call in self.bulb.calls],
+                         ["set_mode", "set_music_colour", "set_music_colour"])
+
+
+class ReplyDrainTests(unittest.TestCase):
+    def test_complete_replies_are_drained_and_partial_packet_is_left_intact(self):
+        connection, peer = socket.socketpair()
+        packet = struct.pack(">4I", 0x55AA, 1, 7, 12) + bytes(12)
+
+        class Device:
+            socket = connection
+            socketRetryLimit = 1
+            received = 0
+
+            def set_socketRetryLimit(self, value):
+                self.socketRetryLimit = value
+
+            def receive(self):
+                self.assert_no_retry()
+                self.socket.recv(len(packet))
+                self.received += 1
+                return None
+
+            def assert_no_retry(self):
+                if self.socketRetryLimit:
+                    raise AssertionError("Reading a null ACK must not wait for a second reply")
+
+            def close(self):
+                self.socket.close()
+
+        device = Device()
+        try:
+            peer.sendall(packet * 3 + packet[:20])
+            drain_responses(device)
+            self.assertEqual(device.received, 3)
+            self.assertEqual(device.socketRetryLimit, 1)
+            self.assertEqual(connection.recv(65536, socket.MSG_PEEK), packet[:20])
+            peer.sendall(packet[20:])
+            drain_responses(device)
+            self.assertEqual(device.received, 4)
+        finally:
+            connection.close()
+            peer.close()
 
 
 if __name__ == "__main__":

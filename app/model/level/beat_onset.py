@@ -44,14 +44,14 @@ class BeatOnsetDetector:
         self.elapsed = 0.0
         self.last_onset = False
 
-    def __call__(self, data, *, magnitude=None, rms=None):
+    def __call__(self, data, *, magnitude=None, rms=None, hop_size=None):
         size = np.asarray(data).shape[0] if np.asarray(data).ndim else 0
         self.last_onset = False
         if size < 16:
             return 0.0
         if magnitude is None or rms is None:
             magnitude, rms = audio_features(data)
-        dt = size / self.samplerate
+        dt = (size if hop_size is None else hop_size) / self.samplerate
         self.elapsed += dt
         self.cooldown = max(0.0, self.cooldown - dt)
         self.output *= math.exp(-dt / self.release_seconds)
@@ -86,7 +86,9 @@ class BeatOnsetDetector:
         threshold = max(0.12, baseline + max(0.08, 2.5 * spread))
         if (self.elapsed >= self.warmup_seconds and self.cooldown == 0.0
                 and attack and rms >= self.min_rms and novelty > threshold):
-            strength = float(np.clip((novelty - baseline) / max(0.35, threshold - baseline), 0.0, 1.0))
+            # Soft compression preserves differences between attacks instead of
+            # clipping almost every percussive transient to a full-scale flash.
+            strength = -math.expm1(-(novelty - baseline) / max(0.55, threshold - baseline))
             self.output = max(self.output, strength)
             self.cooldown = self.refractory_seconds
             self.last_onset = True

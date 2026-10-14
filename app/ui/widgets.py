@@ -115,7 +115,7 @@ class SpectrumWidget(QtWidgets.QWidget):
 
 
 class BeatGraphWidget(QtWidgets.QWidget):
-    def __init__(self, max_points=360, duration_seconds=8.0):
+    def __init__(self, max_points=600, duration_seconds=8.0):
         super().__init__()
         self.setMinimumHeight(220)
         self.setMinimumWidth(260)

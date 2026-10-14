@@ -49,6 +49,7 @@ DEFAULT_SETTINGS = {
     "min_brightness": 25,
     "max_brightness": 100,
     "smoothing": 0.28,
+    "lamp_update_hz": 20,
     "beat_scale": 1.0,
     "beat_threshold": 0.08,
     "beat_decay": 0.08,
@@ -123,6 +124,7 @@ def normalized_settings(data):
         settings["max_brightness"] = settings["min_brightness"]
 
     settings["smoothing"] = clamp_number(settings.get("smoothing"), 0.05, 0.80, 0.28)
+    settings["lamp_update_hz"] = int(clamp_number(settings.get("lamp_update_hz"), 5, 30, 20))
     settings["beat_scale"] = clamp_number(settings.get("beat_scale"), 0.0, 2.0, 1.0)
     settings["beat_threshold"] = clamp_number(settings.get("beat_threshold"), 0.0, 0.80, 0.08)
     settings["beat_decay"] = clamp_number(settings.get("beat_decay"), 0.01, 0.40, 0.08)

@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from model.audio import SAMPLE_RATE, audio_features, spectrum
 from model.level.beat_onset import BeatOnsetDetector
+from model.audio_stream import LiveAudioBuffer
+from model.settings import normalized_settings
 
 
 class AudioTests(unittest.TestCase):
@@ -60,6 +62,12 @@ class AudioTests(unittest.TestCase):
             audio[mask] += 0.12 * rng.normal(size=sum(mask)) * np.exp(-30 * elapsed[mask])
         self.assert_attacks(audio)
 
+    def test_percussive_strengths_do_not_clip_to_full_scale(self):
+        found, levels = self.detect(self.kicks(0.7))
+        self.assertEqual(len(found), len(self.attacks))
+        self.assertGreater(levels.max(), 0.5)
+        self.assertLess(levels.max(), 0.9)
+
     def test_stationary_signals_do_not_trigger(self):
         signals = [np.zeros(len(self.times)), 0.02 * np.random.default_rng(7).normal(size=len(self.times))]
         signals += [0.2 * np.sin(2 * np.pi * hz * self.times) for hz in (60, 90, 440, 3000)]
@@ -97,6 +105,30 @@ class AudioTests(unittest.TestCase):
         for audio in ([], [float("nan")] * 1024, [float("inf")] * 1024):
             self.assertTrue(np.all(np.isfinite(spectrum(audio))))
             self.assertEqual(BeatOnsetDetector()(audio), 0.0)
+
+    def test_variable_backend_packets_have_short_onset_latency(self):
+        audio = self.kicks() + 0.25 * np.sin(2 * np.pi * 440 * self.times)
+        for packet_size in (441, 480, 512):
+            with self.subTest(packet_size=packet_size):
+                buffer, detector = LiveAudioBuffer(), BeatOnsetDetector()
+                found = []
+                for offset in range(0, len(audio) - packet_size, packet_size):
+                    frame = buffer.push(audio[offset:offset + packet_size])
+                    if frame is None:
+                        continue
+                    window, hop = frame
+                    detector(window, hop_size=hop)
+                    if detector.last_onset:
+                        found.append((offset + packet_size) / SAMPLE_RATE)
+                    self.assertLessEqual(len(buffer.samples), 1024)
+                self.assertEqual(len(found), len(self.attacks))
+                latency = np.asarray(found) - self.attacks
+                self.assertTrue(np.all((latency >= 0) & (latency < 0.035)), latency)
+
+    def test_lamp_rate_settings_are_bounded_and_default_to_twenty(self):
+        self.assertEqual(normalized_settings({})["lamp_update_hz"], 20)
+        self.assertEqual(normalized_settings({"lamp_update_hz": 100})["lamp_update_hz"], 30)
+        self.assertEqual(normalized_settings({"lamp_update_hz": 0})["lamp_update_hz"], 5)
 
 
 if __name__ == "__main__":
