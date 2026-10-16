@@ -86,10 +86,11 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_commands_back_off_and_recover(self):
         self.bulb.error = {"Error": "unavailable", "Err": "901"}
         await self.controller.set_colors({"lamp": (100, 20, 10)})
+        device = self.controller.async_devices[0]
+        device.retry_after = float("inf")
         for _ in range(50):
             await self.controller.set_colors({"lamp": (100, 20, 10)})
         self.assertEqual(len(self.bulb.calls), 1)
-        device = self.controller.async_devices[0]
         self.assertIsNone(device.mode)
         self.assertTrue(device.last_error)
         device.retry_after = 0
@@ -129,6 +130,16 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.set_colors({"lamp": (100, 100, 100)}, white_mode="rgb", wait_for_response=False)
         self.assertEqual([call[0] for call in self.bulb.calls],
                          ["set_mode", "set_music_colour", "set_music_colour"])
+
+    async def test_seek_generation_discards_command_waiting_for_rate_limit(self):
+        controller = TuyaLampController([self.bulb], commands_per_second=10)
+        await controller.set_colors({"lamp": (0, 100, 0)}, music=False, generation=0)
+        old = asyncio.create_task(controller.set_colors({"lamp": (255, 0, 0)}, music=False, generation=0))
+        await asyncio.sleep(0.01)
+        generation = controller.invalidate_pending()
+        await old
+        await controller.set_colors({"lamp": (0, 0, 255)}, music=False, generation=generation)
+        self.assertEqual([call[1][:3] for call in self.bulb.calls], [(0, 100, 0), (0, 0, 255)])
 
 
 class ReplyDrainTests(unittest.TestCase):

@@ -124,6 +124,24 @@ class BeatGraphWidget(QtWidgets.QWidget):
         self.history = deque(maxlen=self.max_points)
         self._background = None
         self._background_key = None
+        self._dirty = False
+        self.paint_timer = QtCore.QTimer(self)
+        self.paint_timer.setInterval(33)
+        self.paint_timer.timeout.connect(self._refresh_plot)
+
+    def _refresh_plot(self):
+        if self._dirty:
+            self._dirty = False
+            self.update()
+
+    def showEvent(self, event):
+        self.paint_timer.start()
+        self._dirty = True
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self.paint_timer.stop()
+        super().hideEvent(event)
 
     @staticmethod
     def valid_level(value):
@@ -150,7 +168,7 @@ class BeatGraphWidget(QtWidgets.QWidget):
         cutoff = timestamp - self.duration_seconds
         while len(self.history) > 1 and self.history[1][0] < cutoff:
             self.history.popleft()
-        self.update()
+        self._dirty = True
 
     def clear(self):
         self.history.clear()
@@ -240,42 +258,39 @@ class BeatGraphWidget(QtWidgets.QWidget):
 
         if self.history:
             samples = list(self.history)
-            path = self.curve_path(plot, samples, 1)
-            fill_path = QtGui.QPainterPath()
-            # Close each continuous segment separately to leave recording gaps blank.
-            segment = []
             start = samples[-1][0] - self.duration_seconds
-            for sample in samples + [None]:
-                if segment and (sample is None or sample[0] - segment[-1][0] > 0.2):
-                    fill_segment = QtGui.QPainterPath()
-                    first_x = plot.left() + (segment[0][0] - start) / self.duration_seconds * plot.width()
-                    fill_segment.moveTo(first_x, plot.bottom())
-                    for point in segment:
-                        x = plot.left() + (point[0] - start) / self.duration_seconds * plot.width()
-                        fill_segment.lineTo(x, plot.bottom() - point[1] * plot.height())
-                    fill_segment.lineTo(x, plot.bottom())
-                    fill_segment.closeSubpath()
-                    fill_path.addPath(fill_segment)
-                    segment = []
-                if sample is not None:
-                    segment.append(sample)
-
             painter.save()
             painter.setClipRect(plot)
-
-            fill = QtGui.QLinearGradient(plot.topLeft(), plot.bottomLeft())
-            fill.setColorAt(0.0, QtGui.QColor(98, 229, 171, 70))
-            fill.setColorAt(1.0, QtGui.QColor(98, 229, 171, 4))
-            painter.setBrush(QtGui.QBrush(fill))
-            painter.setPen(QtCore.Qt.NoPen)
-            painter.drawPath(fill_path)
-
-            painter.setBrush(QtCore.Qt.NoBrush)
-            painter.setPen(QtGui.QPen(QtGui.QColor("#40c0ff"), 1.5, QtCore.Qt.DashLine))
-            painter.drawPath(self.curve_path(plot, samples, 2))
-            painter.setPen(QtGui.QPen(QtGui.QColor("#62e5ab"), 2, QtCore.Qt.SolidLine,
-                                     QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
-            painter.drawPath(path)
+            # Raster polylines avoid Qt's expensive antialiased path stroker on
+            # dense, jagged waveforms. One polygon per gap also keeps gaps blank.
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+            segments, segment = [], []
+            for sample in samples:
+                if segment and sample[0] - segment[-1][0] > 0.2:
+                    segments.append(segment)
+                    segment = []
+                segment.append(sample)
+            if segment:
+                segments.append(segment)
+            for segment in segments:
+                response, raw = QtGui.QPolygonF(), QtGui.QPolygonF()
+                for timestamp, level, raw_level, _ in segment:
+                    x = plot.left() + (timestamp - start) / self.duration_seconds * plot.width()
+                    response.append(QtCore.QPointF(x, plot.bottom() - level * plot.height()))
+                    raw.append(QtCore.QPointF(x, plot.bottom() - raw_level * plot.height()))
+                if len(response) > 1:
+                    fill = QtGui.QPolygonF([QtCore.QPointF(response[0].x(), plot.bottom())])
+                    fill += response
+                    fill.append(QtCore.QPointF(response[-1].x(), plot.bottom()))
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.setBrush(QtGui.QColor(98, 229, 171, 22))
+                    painter.drawPolygon(fill)
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.setPen(QtGui.QPen(QtGui.QColor("#40c0ff"), 1))
+                painter.drawPolyline(raw)
+                painter.setPen(QtGui.QPen(QtGui.QColor("#62e5ab"), 1))
+                painter.drawPolyline(response)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
             for timestamp, level, raw_level, onset in samples:
                 if onset:
                     x = plot.left() + (timestamp - start) / self.duration_seconds * plot.width()
@@ -315,6 +330,23 @@ def app_stylesheet():
     }
     QLabel#muted {
         color: #9aa6b2;
+    }
+    QFrame#playerHeader {
+        border: 1px solid #303941;
+        border-radius: 8px;
+    }
+    QFrame#playerHeader QToolButton {
+        background: #26313a;
+        border: 1px solid #3a4650;
+        border-radius: 5px;
+        padding: 4px;
+    }
+    QFrame#playerHeader QToolButton:hover {
+        background: #31404b;
+    }
+    QFrame#playerHeader QToolButton:checked {
+        background: #234b3c;
+        border-color: #62e5ab;
     }
     QGroupBox {
         border: 1px solid #303941;

@@ -17,6 +17,8 @@ from model.lamp_layout import build_lamp_positions
 from model.level.beat_response import BeatEnvelope, smooth_lamp_level
 from model.settings import load_settings, normalize_profile, save_settings
 from ui.LampWidget import LampWidget
+from ui.MusicPanel import MusicPanel
+from ui.global_hotkeys import GlobalMediaKeys
 from ui.widgets import BeatGraphWidget, ColorButton, SpectrumWidget
 
 
@@ -24,10 +26,16 @@ class AudioVisualizer(QtWidgets.QWidget):
     diagnosticsReady = QtCore.pyqtSignal(list)
     lampUpdateFinished = QtCore.pyqtSignal()
 
-    def __init__(self, tuya_controller: TuyaLampController = None, async_loop=None):
+    def __init__(self, tuya_controller: TuyaLampController = None, async_loop=None, music_root=None, music_backend=None):
         super().__init__()
         self.tuya_controller = tuya_controller
         self.async_loop = async_loop
+        self.music_root = music_root
+        self.music_backend = music_backend
+        self.light_source = "live"
+        self.light_generation = 0
+        self.queued_generations = {}
+        self.inflight_generations = {}
         self.setWindowTitle("Music Light")
         self.resize(1180, 780)
 
@@ -92,6 +100,10 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.diagnosticsReady.connect(self.render_diagnostics)
         self.init_ui()
         self.apply_loaded_settings()
+        self.hotkeys = GlobalMediaKeys(self)
+        self.hotkeys.activated.connect(self.on_global_media_key, QtCore.Qt.QueuedConnection)
+        if self.hotkeys.error:
+            self.music_panel.status.setText(self.hotkeys.error.strip())
         self.update_preview({}, np.zeros(SPECTRUM_BINS), 0.0, self.static_color)
 
     def get_microphones(self):
@@ -139,19 +151,43 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.connection_label = QtWidgets.QLabel(self.connection_summary())
         self.connection_label.setObjectName("muted")
         header.addWidget(title)
+        self.light_source_combo = QtWidgets.QComboBox()
+        self.light_source_combo.addItem("Реальное время", "live")
+        self.light_source_combo.addItem("Музыка", "player")
+        self.light_source_combo.currentIndexChanged.connect(self.on_light_source_changed)
+        header.addWidget(self.light_source_combo)
         header.addStretch(1)
         header.addWidget(self.connection_label)
         root.addLayout(header)
 
+        self.music_panel = MusicPanel(self.device_ids, self.tuya_controller, self.async_loop,
+                                      root=self.music_root, backend=self.music_backend, parent=self)
+        root.addWidget(self.music_panel.player_header)
+        self.music_panel.player_header.show()
         self.tabs = QtWidgets.QTabWidget()
-        self.tabs.addTab(self.build_control_tab(), "Управление")
-        self.tabs.addTab(self.build_beat_tab(), "Бит")
+        self.control_page = self.build_control_tab()
+        self.beat_page = self.build_beat_tab()
+        self.tabs.addTab(self.control_page, "Управление")
+        self.tabs.addTab(self.music_panel.library_page, "Музыка")
+        self.tabs.addTab(self.music_panel.playlists_page, "Плейлист")
+        self.tabs.addTab(self.beat_page, "Бит")
         self.tabs.addTab(self.build_diagnostics_tab(), "Диагностика")
+        self.music_panel.sourceRequested.connect(self.select_light_source)
+        self.music_panel.colorsReady.connect(self.on_music_colors)
+        self.music_panel.previewReady.connect(self.on_music_preview)
+        self.music_panel.beatReady.connect(self.on_music_beat)
+        self.music_panel.player.trackChanged.connect(self.on_music_track_changed)
+        self.music_panel.player.seekRequested.connect(self.on_music_seek)
+        self.music_panel.invalidateRequested.connect(self.invalidate_music_scene)
+        self.music_panel.rateChanged.connect(self.on_music_rate_changed)
         root.addWidget(self.tabs, 1)
+        root.addWidget(self.music_panel)
 
     def build_control_tab(self):
+        self.control_stack = QtWidgets.QStackedWidget()
         page = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(page)
+        self.live_control_layout = layout
         layout.setContentsMargins(0, 12, 0, 0)
         layout.setSpacing(14)
 
@@ -165,12 +201,14 @@ class AudioVisualizer(QtWidgets.QWidget):
         left_layout.addWidget(self.build_actions_group())
 
         visual = QtWidgets.QWidget()
+        self.visual_panel = visual
         visual_layout = QtWidgets.QVBoxLayout(visual)
         visual_layout.setContentsMargins(0, 0, 0, 0)
         visual_layout.setSpacing(12)
 
         self.spectrum_widget = SpectrumWidget()
         self.lamp_widget = LampWidget(self.lamp_positions)
+        self.lamp_widget.setMinimumSize(300, 260)
         self.lamp_widget.set_selected_lamps(self.active_lamps)
         self.lamp_widget.lampToggled.connect(self.set_lamp_enabled)
 
@@ -207,7 +245,21 @@ class AudioVisualizer(QtWidgets.QWidget):
         layout.addWidget(left_sidebar)
         layout.addWidget(visual, 1)
         layout.addWidget(right_scroll)
-        return page
+        self.control_stack.addWidget(page)
+
+        player_page = QtWidgets.QWidget()
+        self.player_control_layout = QtWidgets.QHBoxLayout(player_page)
+        self.player_control_layout.setContentsMargins(0, 12, 0, 0)
+        self.player_control_layout.setSpacing(14)
+        settings_scroll = QtWidgets.QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setMinimumWidth(480)
+        settings_scroll.setMaximumWidth(600)
+        settings_scroll.setWidget(self.music_panel.settings_page)
+        self.music_panel.settings_page.show()
+        self.player_control_layout.addWidget(settings_scroll)
+        self.control_stack.addWidget(player_page)
+        return self.control_stack
 
     def build_audio_group(self):
         group = QtWidgets.QGroupBox("Аудио")
@@ -488,7 +540,8 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.sync_lamp_controls()
 
     def connection_summary(self):
-        return f"Ламп: {len(self.device_ids)} · выбрано: {len(self.active_lamps)}"
+        selected = self.music_panel.settings["lamp_ids"] if self.light_source == "player" and hasattr(self, "music_panel") else self.active_lamps
+        return f"Ламп: {len(self.device_ids)} · выбрано: {len(selected)}"
 
     def make_percent_spin(self, value):
         spin = QtWidgets.QSpinBox()
@@ -527,6 +580,9 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.connection_label.setText(self.connection_summary())
 
     def set_lamp_enabled(self, lamp_id, enabled):
+        if self.light_source == "player":
+            self.music_panel.set_lamp_enabled(lamp_id, enabled)
+            return
         if enabled:
             self.active_lamps.add(lamp_id)
         else:
@@ -551,10 +607,8 @@ class AudioVisualizer(QtWidgets.QWidget):
         if not self.timer.isActive():
             return
         if self.mode == "static":
-            self.stop_audio_capture()
             self.apply_static_color()
-        else:
-            self.ensure_audio_capture()
+        self.ensure_audio_capture()
 
     def on_source_changed(self):
         if not self.timer.isActive() or not self.mic_devices:
@@ -879,7 +933,7 @@ class AudioVisualizer(QtWidgets.QWidget):
             self.apply_static_color()
 
     def start_stream(self):
-        if self.timer.isActive() or self._closing:
+        if self.timer.isActive() or self._closing or self.light_source != "live":
             return
         if self.mode != "static" and not self.mic_devices:
             QtWidgets.QMessageBox.warning(self, "Аудио", "Аудиоустройства не найдены")
@@ -938,9 +992,9 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.settings_status.setText("Все лампы выключены")
 
     def update_visualization(self):
-        mode = self.mode_combo.currentData()
-        if mode == "static":
+        if self.light_source != "live":
             return
+        mode = self.mode_combo.currentData()
 
         frame = self.audio_worker.take_frame() if self.audio_worker else None
         if frame is None:
@@ -952,6 +1006,11 @@ class AudioVisualizer(QtWidgets.QWidget):
         raw_spectrum_level = float(np.max(bars)) if len(bars) else 0.0
         bars = np.clip(bars * self.beat_scale, 0.0, 1.0)
         rms_level = self.filtered_beat_level(raw_rms_level * self.beat_scale, dt, onset=onset)
+        self.update_beat_graph(rms_level, raw_rms_level * self.beat_scale, onset, timestamp)
+        if mode == "static":
+            # Observe audio without resending the static lamp colour each frame.
+            self.spectrum_widget.set_data(bars, rms_level, self.static_color)
+            return
         spectrum_level = clamp(raw_spectrum_level * self.beat_scale)
         self.spectrum_response_level = smooth_lamp_level(
             self.spectrum_response_level, spectrum_level, dt, self.smoothing_factor, spectrum=True
@@ -983,7 +1042,6 @@ class AudioVisualizer(QtWidgets.QWidget):
             final_colors[lamp_id] = color
             display_colors[lamp_id] = color
 
-        self.update_beat_graph(rms_level, raw_rms_level * self.beat_scale, onset, timestamp)
         self.update_preview(display_colors, bars, visual_level, current_color)
         self.send_colors(final_colors, global_brightness)
 
@@ -1035,7 +1093,7 @@ class AudioVisualizer(QtWidgets.QWidget):
         return "тихий"
 
     def ensure_audio_capture(self):
-        if self.mode == "static" or not self.timer.isActive() or not self.selected_mic:
+        if not self.timer.isActive() or not self.selected_mic:
             return
         if self.audio_worker:
             if self.audio_worker.microphone is not self.selected_mic:
@@ -1084,13 +1142,16 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.beat_graph_widget.add_level(level, raw_level, onset, timestamp)
         self.beat_percent_label.setText(f"Бит: {int(level * 100)}% · {self.beat_tier(level)}")
 
-    def send_colors(self, colors, brightness, *, music=True):
+    def send_colors(self, colors, brightness, *, music=True, source="live"):
+        if source != self.light_source:
+            return
         if not self.tuya_controller or not colors or not self.async_loop or not self.async_loop.is_running():
             return
         # Keep the latest requested state of each lamp, including an explicit off.
         self.queued_colors.update(colors)
         for lamp_id in colors:
             self.queued_options[lamp_id] = (brightness, music)
+            self.queued_generations[lamp_id] = self.light_generation
         self.flush_lamp_updates()
 
     def flush_lamp_updates(self):
@@ -1098,7 +1159,10 @@ class AudioVisualizer(QtWidgets.QWidget):
             if not future.done():
                 continue
             color, options = self.inflight_updates.pop(lamp_id)
+            generation = self.inflight_generations.pop(lamp_id, self.light_generation)
             del self.pending_lamp_updates[lamp_id]
+            if generation != self.light_generation:
+                continue
             try:
                 errors = future.result() or {}
                 error = errors.get(lamp_id, "")
@@ -1109,6 +1173,7 @@ class AudioVisualizer(QtWidgets.QWidget):
                 if not self._closing:
                     self.queued_colors.setdefault(lamp_id, color)
                     self.queued_options.setdefault(lamp_id, options)
+                    self.queued_generations.setdefault(lamp_id, generation)
                     retry = next((dev.retry_after for dev in getattr(self.tuya_controller, "async_devices", [])
                                   if dev.device.id == lamp_id), 0.0)
                     self.lamp_retry_after[lamp_id] = max(time.monotonic() + 0.1, retry)
@@ -1116,7 +1181,8 @@ class AudioVisualizer(QtWidgets.QWidget):
                 self.lamp_retry_after.pop(lamp_id, None)
 
         now = time.monotonic()
-        interval = 1.0 / self.lamp_update_hz
+        update_hz = self.music_panel.settings["update_hz"] if self.light_source == "player" else self.lamp_update_hz
+        interval = 1.0 / update_hz
         deadlines = []
         for lamp_id in list(self.queued_colors):
             # Each device has one in-flight command and one replaceable next state.
@@ -1129,12 +1195,14 @@ class AudioVisualizer(QtWidgets.QWidget):
                 continue
             color = self.queued_colors.pop(lamp_id)
             brightness, music = self.queued_options.pop(lamp_id)
+            generation = self.queued_generations.pop(lamp_id, self.light_generation)
             self.inflight_updates[lamp_id] = (color, (brightness, music))
+            self.inflight_generations[lamp_id] = generation
             self.last_lamp_sends[lamp_id] = now
             future = asyncio.run_coroutine_threadsafe(
                 self.tuya_controller.set_colors({lamp_id: color}, brightness, music=music,
                                                 white_mode="rgb" if music else "auto",
-                                                wait_for_response=not music), self.async_loop
+                                                wait_for_response=not music, generation=generation), self.async_loop
             )
             self.pending_lamp_updates[lamp_id] = future
             future.add_done_callback(lambda _future: self.lampUpdateFinished.emit())
@@ -1142,6 +1210,88 @@ class AudioVisualizer(QtWidgets.QWidget):
             self.lamp_timer.start(max(1, math.ceil((min(deadlines) - time.monotonic()) * 1000)))
         else:
             self.lamp_timer.stop()
+
+    def select_light_source(self, source):
+        index = self.light_source_combo.findData(source)
+        if index >= 0:
+            self.light_source_combo.setCurrentIndex(index)
+
+    def invalidate_light_scene(self):
+        self.light_generation += 1
+        if self.tuya_controller and hasattr(self.tuya_controller, "invalidate_pending"):
+            self.light_generation = self.tuya_controller.invalidate_pending()
+        self.queued_colors.clear()
+        self.queued_options.clear()
+        self.queued_generations.clear()
+        self.lamp_timer.stop()
+
+    def invalidate_music_scene(self):
+        if self.light_source == "player" and not self._closing:
+            self.invalidate_light_scene()
+
+    def on_light_source_changed(self):
+        source = self.light_source_combo.currentData()
+        if source == self.light_source:
+            return
+        if self.light_source == "live":
+            self.stop_stream(send_to_lamps=False)
+        else:
+            self.music_panel.set_source_active(False)
+        self.light_source = source
+        self.invalidate_light_scene()
+        self.music_panel.set_source_active(source == "player")
+        self.clear_beat_graph()
+        if source == "player":
+            self.live_control_layout.removeWidget(self.visual_panel)
+            self.player_control_layout.addWidget(self.visual_panel, 1)
+            self.control_stack.setCurrentIndex(1)
+            self.beat_scale_hint.setText("Анализ композиции · 50 Гц")
+            self.lamp_widget.set_selected_lamps(self.music_panel.settings["lamp_ids"])
+        else:
+            self.player_control_layout.removeWidget(self.visual_panel)
+            self.live_control_layout.insertWidget(1, self.visual_panel, 1)
+            self.control_stack.setCurrentIndex(0)
+            self.beat_scale_hint.setText(f"Масштаб: x{self.beat_scale:.2f}")
+            if self.tuya_controller:
+                self.tuya_controller.set_update_rate(self.lamp_update_hz)
+            self.lamp_widget.set_selected_lamps(self.active_lamps)
+        self.visual_panel.show()
+        self.connection_label.setText(self.connection_summary())
+
+    def on_music_rate_changed(self, rate):
+        if self.light_source == "player" and self.tuya_controller:
+            self.tuya_controller.set_update_rate(rate)
+
+    def on_music_colors(self, colors):
+        if self.light_source == "player" and not self._closing:
+            self.send_colors(colors, 1.0, source="player")
+
+    def on_music_preview(self, bars, energy, colors):
+        if self.light_source == "player":
+            color = next((value for value in colors.values() if any(value)), (0, 0, 0))
+            self.lamp_widget.set_selected_lamps(self.music_panel.settings["lamp_ids"])
+            self.connection_label.setText(self.connection_summary())
+            self.update_preview(colors, bars, energy, color)
+
+    def on_music_beat(self, level, raw_level, onset, position):
+        if self.light_source == "player" and not self._closing:
+            self.update_beat_graph(level, raw_level, onset, position)
+
+    def on_music_track_changed(self, _track_id):
+        if self.light_source == "player":
+            self.clear_beat_graph()
+
+    def on_music_seek(self, _position):
+        if self.light_source == "player":
+            self.clear_beat_graph()
+
+    def on_global_media_key(self, action):
+        if self._closing:
+            return
+        if action == "previous":
+            self.music_panel.player.previous(force=True)
+        elif action == "next":
+            self.music_panel.player.next()
 
     def refresh_diagnostics(self):
         if not self.tuya_controller or not self.async_loop:
@@ -1191,7 +1341,8 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.diagnostics_table.setRowCount(len(known_rows))
         ok_count = 0
         for row_index, row in enumerate(known_rows):
-            is_enabled = row["id"] in self.active_lamps
+            selected = self.music_panel.settings["lamp_ids"] if self.light_source == "player" else self.active_lamps
+            is_enabled = row["id"] in selected
             ok = row.get("ok")
             if ok:
                 ok_count += 1
@@ -1229,12 +1380,17 @@ class AudioVisualizer(QtWidgets.QWidget):
     def closeEvent(self, event):
         if not self._closing:
             self._closing = True
+            self.hotkeys.close()
             self.setEnabled(False)
             self.save_current_settings()
             self.stop_stream(send_to_lamps=self.timer.isActive())
+            if self.light_source == "player":
+                self.invalidate_light_scene()
+                self.send_colors({lamp: (0, 0, 0) for lamp in self.device_ids}, 0.0, source="player")
+        music_stopped = self.music_panel.shutdown()
         self.flush_lamp_updates()
         if ((self.audio_worker and self.audio_worker.isRunning()) or self.queued_colors
-                or self.pending_lamp_updates):
+                or self.pending_lamp_updates or not music_stopped):
             event.ignore()
             QtCore.QTimer.singleShot(50, self.close)
             return

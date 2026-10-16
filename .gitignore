@@ -3,3 +3,4 @@
 .brak/
 **/*.json
 __pycache__/
+app/data/

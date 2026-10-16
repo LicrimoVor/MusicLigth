@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import tempfile
 import time
 from types import SimpleNamespace
 import unittest
@@ -83,13 +84,14 @@ class VisualizerTests(unittest.TestCase):
             cls.app.setFont(QtGui.QFont("Segoe UI", 10))
 
     def setUp(self):
+        self.music_directory = tempfile.TemporaryDirectory()
         self.controller = FakeController()
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self.loop_thread.start()
         with patch("ui.AudioVisualizer.sc.all_microphones", return_value=[]), \
                 patch("ui.AudioVisualizer.load_settings", return_value=normalized_settings({})):
-            self.window = AudioVisualizer(self.controller, self.loop)
+            self.window = AudioVisualizer(self.controller, self.loop, music_root=self.music_directory.name)
         self.window.save_current_settings = lambda: None
 
     def tearDown(self):
@@ -100,10 +102,13 @@ class VisualizerTests(unittest.TestCase):
         self.window.queued_options.clear()
         self.wait_sends()
         self.window.close()
+        self.window.music_panel.jobs.wait(2000)
+        self.window.close()
         self.app.processEvents()
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.loop_thread.join(timeout=2)
         self.loop.close()
+        self.music_directory.cleanup()
 
     def wait_sends(self):
         for future in list(self.window.pending_lamp_updates.values()):
@@ -178,6 +183,7 @@ class VisualizerTests(unittest.TestCase):
         self.window.flush_lamp_updates()
         self.wait_sends()
         event = QtGui.QCloseEvent()
+        self.assertTrue(self.window.music_panel.jobs.wait(2000))
         self.window.closeEvent(event)
         self.assertTrue(event.isAccepted())
         self.assertEqual(self.sent_colors(), {"a": (0, 0, 0), "b": (0, 0, 0)})
@@ -193,12 +199,28 @@ class VisualizerTests(unittest.TestCase):
         self.assertEqual(len(self.controller.calls), 2)
         self.assertFalse(self.controller.calls[0][2]["music"])
 
+    def test_static_mode_still_updates_beat_graph_without_sending_music_colors(self):
+        self.window.mode_combo.setCurrentIndex(self.window.mode_combo.findData("static"))
+        self.window.start_stream()
+        self.wait_sends()
+        calls = len(self.controller.calls)
+        frame = (np.ones(32, dtype=np.float32) * 0.5, 0.7, True, 1.0)
+        worker = SimpleNamespace(take_frame=lambda: frame)
+        with patch.object(self.window, "audio_worker", worker):
+            self.window.update_visualization()
+        self.assertEqual(len(self.controller.calls), calls)
+        self.assertEqual(self.window.beat_graph_widget.history[-1][0], 1.0)
+        self.assertTrue(self.window.beat_graph_widget.history[-1][3])
+        self.assertGreater(float(np.max(self.window.spectrum_widget.bars)), 0)
+
     def test_capture_uses_one_recorder_and_preserves_short_attacks(self):
         microphone = FakeMicrophone()
         worker = AudioCaptureWorker(microphone)
         worker.start()
         try:
-            QtTest.QTest.qWait(100)
+            deadline = time.monotonic() + 2
+            while microphone.frames < 12 and time.monotonic() < deadline:
+                QtTest.QTest.qWait(20)
             frame = worker.take_frame()
             self.assertIsNotNone(frame)
             self.assertTrue(frame[2])

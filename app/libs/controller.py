@@ -62,25 +62,41 @@ class AsyncTuyaDevice:
         self.mode = None
         self.color_state = None
         self.color_sent_at = 0.0
+        self.command_generation = 0
+        self.last_command_latency_ms = 0.0
 
     def invalidate_state(self):
         self.power = None
         self.mode = None
         self.color_state = None
 
-    def _send_sync(self, command, args):
-        drain_responses(self.device)
-        return getattr(self.device, command)(*args)
+    def check_generation(self, generation):
+        if generation is not None and generation != self.command_generation:
+            raise SupersededCommand()
 
-    async def send_command(self, command, *args):
+    def _send_sync(self, command, args, generation=None):
+        self.check_generation(generation)
+        drain_responses(self.device)
+        self.check_generation(generation)
+        started = time.perf_counter()
+        try:
+            return getattr(self.device, command)(*args)
+        finally:
+            self.last_command_latency_ms = (time.perf_counter() - started) * 1000
+
+    async def send_command(self, command, *args, generation=None):
+        self.check_generation(generation)
         loop = asyncio.get_running_loop()
         delay = self.next_command_at - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
+        self.check_generation(generation)
         self.next_command_at = time.monotonic() + self.command_interval
         try:
-            result = await loop.run_in_executor(None, partial(self._send_sync, command, args))
+            result = await loop.run_in_executor(None, partial(self._send_sync, command, args, generation))
             error = str(result) if isinstance(result, dict) and (result.get("Error") or result.get("Err")) else ""
+        except SupersededCommand:
+            raise
         except Exception as exc:
             result, error = None, str(exc)
 
@@ -110,9 +126,14 @@ class AsyncTuyaDevice:
                 "version": getattr(self.device, "version", ""),
                 "ok": ok,
                 "latency_ms": latency_ms,
+                "network_latency_ms": self.last_command_latency_ms,
                 "status": status,
                 "error": "" if ok else str(status),
             }
+
+
+class SupersededCommand(Exception):
+    """A queued light command belongs to an old track, seek or input source."""
 
 
 class TuyaLampController:
@@ -120,6 +141,13 @@ class TuyaLampController:
         self.devices = devices
         self.async_devices = [AsyncTuyaDevice(dev, commands_per_second) for dev in devices]
         self.color_tolerance = max(0, int(color_tolerance))
+        self.generation = 0
+
+    def invalidate_pending(self):
+        self.generation += 1
+        for device in self.async_devices:
+            device.command_generation = self.generation
+        return self.generation
 
     def set_update_rate(self, updates_per_second):
         interval = 1.0 / max(1.0, float(updates_per_second))
@@ -127,21 +155,25 @@ class TuyaLampController:
             device.command_interval = interval
 
     async def set_color(self, device, r, g, b, brightness, *, music=True,
-                        white_mode="auto", white_temperature=50, wait_for_response=True):
+                        white_mode="auto", white_temperature=50, wait_for_response=True, generation=None):
         async with device.lock:
-            await self._set_color_locked(device, r, g, b, brightness, music=music,
+            try:
+                await self._set_color_locked(device, r, g, b, brightness, music=music,
                                          white_mode=white_mode, white_temperature=white_temperature,
-                                         wait_for_response=wait_for_response)
+                                         wait_for_response=wait_for_response, generation=generation)
+            except SupersededCommand:
+                return
 
     async def _set_color_locked(self, device, r, g, b, brightness, *, music,
-                                white_mode, white_temperature, wait_for_response):
+                                white_mode, white_temperature, wait_for_response, generation):
+        device.check_generation(generation)
         if time.monotonic() < device.retry_after:
             return
         tuya_brightness = brightness * 100 if 0 <= brightness <= 1 else brightness
         switch = device.device.dpset.get("switch") or "20"
         if tuya_brightness <= 0 or (r, g, b) == (0, 0, 0):
             if device.power is not False:
-                await device.send_command("set_status", False, switch, False)
+                await device.send_command("set_status", False, switch, False, generation=generation)
                 if not device.last_error:
                     device.power = False
                     device.mode = None
@@ -160,16 +192,16 @@ class TuyaLampController:
         # LEDs, avoiding the tinted white produced by mixing RGB in music mode.
         # set_colour/set_white_percentage include power and mode in one command.
         if mode == "white":
-            await device.send_command("set_white_percentage", r / 255 * 100, white_temperature, False)
+            await device.send_command("set_white_percentage", r / 255 * 100, white_temperature, False, generation=generation)
         elif music:
             if device.mode != "music" or device.power is not True:
-                await device.send_command("set_mode", "music", not wait_for_response)
+                await device.send_command("set_mode", "music", not wait_for_response, generation=generation)
                 if device.last_error:
                     return
                 device.mode, device.power = "music", True
-            await device.send_command("set_music_colour", 0, r, g, b, 0, 0, not wait_for_response)
+            await device.send_command("set_music_colour", 0, r, g, b, 0, 0, not wait_for_response, generation=generation)
         else:
-            await device.send_command("set_colour", r, g, b, False)
+            await device.send_command("set_colour", r, g, b, False, generation=generation)
         if not device.last_error:
             device.mode, device.power = mode, True
             device.color_state = state
