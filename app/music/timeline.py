@@ -10,9 +10,11 @@ from scipy import ndimage
 
 from music.analysis import ANALYSIS_VERSION, AnalysisData, remove_work_directory
 from music.storage import atomic_json, check_cancel
+from model.settings import normalize_color
 
 
-TIMELINE_VERSION = 2
+TIMELINE_VERSION = 3
+DEFAULT_PALETTE = ((255, 77, 38), (51, 166, 255), (184, 89, 242))
 TIMELINE_HZ = 20
 EVENT_TYPES = ("Energy Glow", "Frequency Colors", "Beat Flash", "Bass Pulse", "Color Wave", "Build Up", "Drop")
 EVENT_DTYPE = np.dtype([("timestamp", "<f8"), ("type", "u1"), ("target", "<i2"),
@@ -28,7 +30,11 @@ PRESETS = {
 def show_settings(settings, lamp_ids):
     selected = settings.get("lamp_ids", lamp_ids)
     selected = [item for item in lamp_ids if item in selected]
+    palette = settings.get("palette")
+    palette = palette if isinstance(palette, (list, tuple)) and len(palette) == 3 else DEFAULT_PALETTE
     return {"preset": settings.get("preset") if settings.get("preset") in PRESETS else "Calm",
+            "color_mode": "custom" if settings.get("color_mode") == "custom" else "auto",
+            "palette": [normalize_color(color, DEFAULT_PALETTE[index]) for index, color in enumerate(palette)],
             "intensity": max(0.0, min(1.5, float(settings.get("intensity", 0.7)))),
             "max_brightness": max(0.0, min(1.0, float(settings.get("max_brightness", 0.8)))),
             "update_hz": max(1, min(30, int(settings.get("update_hz", 10)))),
@@ -39,7 +45,7 @@ def show_settings(settings, lamp_ids):
 
 
 def timeline_key(content_identifier, settings):
-    generation = {key: settings[key] for key in ("preset", "intensity", "max_brightness", "lamp_ids")}
+    generation = {key: settings[key] for key in ("preset", "intensity", "max_brightness", "lamp_ids", "color_mode", "palette")}
     payload = json.dumps([content_identifier, ANALYSIS_VERSION, TIMELINE_VERSION, generation], sort_keys=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -150,7 +156,8 @@ class TimelineGenerator:
                 if analysis.features[peak, 2] >= 0.55 and (not bass_onsets or when - bass_onsets[-1] > 0.18):
                     bass_onsets.append(when)
             bass_onsets = np.asarray(bass_onsets)
-            frequency_palette = np.asarray(((1, 0.3, 0.15), (0.2, 0.65, 1), (0.72, 0.35, 0.95)))
+            custom_colors = settings["color_mode"] == "custom"
+            frequency_palette = np.asarray(settings["palette"] if custom_colors else DEFAULT_PALETTE, dtype=float) / 255
             for index in range(count):
                 if index % 100 == 0:
                     check_cancel(cancel)
@@ -170,12 +177,18 @@ class TimelineGenerator:
                         build = max(build, elapsed / transition["duration"] * transition["strength"])
                     elif transition["type"] == "drop" and abs(elapsed) <= transition["duration"]:
                         drop = max(drop, math.exp(-0.5 * (elapsed / 0.12) ** 2) * transition["strength"])
-                beat_duration = 60 / analysis.metadata["bpm"] if analysis.metadata["bpm"] > 0 else 2.0
+                local_tempo = analysis.tempo_at(seconds)
+                beat_duration = 60 / local_tempo if local_tempo > 0 else 2.0
                 for lamp_index in range(len(lamps)):
                     fraction = lamp_index / max(1, len(lamps))
                     hue = 0.57 + seconds / 45 + fraction * 0.12
                     wave = pulse(seconds - fraction * beat_duration, analysis.beats, 0.25)
-                    palette = hue_rgb(hue)
+                    if custom_colors:
+                        level = min(2.0, max(0.0, energy * 2))
+                        left = min(1, int(level))
+                        palette = frequency_palette[left] * (1 - (level - left)) + frequency_palette[left + 1] * (level - left)
+                    else:
+                        palette = hue_rgb(hue)
                     color = palette * (1 - preset["frequency"]) + frequency_color * preset["frequency"]
                     # Stable glow and modest rhythmic accents, rather than full on/off flashes.
                     brightness = maximum * min(1.0, 0.15 + intensity * (
@@ -197,8 +210,8 @@ class TimelineGenerator:
             cues += [(float(time), 1, 1.0) for time in np.arange(0, duration, 1)]
             cues += [(float(time), 2, 0.25) for time in analysis.beats]
             cues += [(float(time), 3, 0.35) for time in bass_onsets]
-            cues += [(float(time), 4, min(2.0, 60 / analysis.metadata["bpm"]))
-                     for time in analysis.beats[::2]] if analysis.metadata["bpm"] > 0 else []
+            cues += [(float(time), 4, min(2.0, 60 / max(1, analysis.tempo_at(float(time)))))
+                     for time in analysis.beats[::2]]
             cues += [(item["time"], 5 if item["type"] == "build_up" else 6, item["duration"])
                      for item in analysis.metadata["transitions"]]
             cues.sort(key=lambda cue: cue[0])

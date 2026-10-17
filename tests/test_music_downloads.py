@@ -11,6 +11,7 @@ import soundfile as sf
 import test_music as shared
 from music.downloads import MusicDownloader
 from music.matching import audio_format, choose_result, rank_results, recording_url
+from music.providers import CatalogProviders
 
 
 def candidate(url, provider="YouTube", duration=190, title="Artist - Song"):
@@ -68,6 +69,11 @@ class MatchingTests(unittest.TestCase):
 
 
 class DownloadPipelineTests(unittest.TestCase):
+    def setUp(self):
+        catalogs = patch.object(CatalogProviders, "search", return_value=[])
+        catalogs.start()
+        self.addCleanup(catalogs.stop)
+
     def test_search_survives_one_provider_failure(self):
         with tempfile.TemporaryDirectory() as root:
             downloader = MusicDownloader(root)
@@ -77,7 +83,7 @@ class DownloadPipelineTests(unittest.TestCase):
                 return [candidate("https://www.youtube.com/watch?v=good")]
             with patch.object(downloader, "_search_source", side_effect=search) as lookup:
                 found = downloader.search({"title": "Song", "artist": "Artist", "duration": 190})
-            self.assertEqual(lookup.call_count, 2)
+            self.assertEqual(lookup.call_count, 4)
             self.assertEqual(len(found), 1)
 
     def test_silent_youtube_file_falls_back_to_soundcloud_and_then_local_cache(self):
@@ -142,7 +148,7 @@ class ReplacementIntegrationTests(unittest.TestCase):
     def test_failed_replacement_preserves_existing_recording_and_statistics(self):
         track = self.make_remote()
         with patch.object(self.panel.jobs.downloader, "fetch", side_effect=RuntimeError("No alternatives")):
-            self.panel.replace_playlist_recording()
+            self.panel._apply_recording_choice(track["id"], candidate("https://soundcloud.com/artist/new", "SoundCloud", 3))
             self.assertTrue(shared.wait_until(lambda: not self.panel.replacing, 4))
         self.assertEqual(self.panel.library.track(track["id"]), track)
         self.assertTrue(Path(track["path"]).is_file())
@@ -155,7 +161,7 @@ class ReplacementIntegrationTests(unittest.TestCase):
         downloaded = {"path": str(replacement), "resolved_url": "https://soundcloud.com/artist/song",
             "resolved_source": "SoundCloud", "source_codec": "mp3", "source_bitrate_kbps": 320}
         with patch.object(self.panel.jobs.downloader, "fetch", return_value=downloaded) as fetch:
-            self.panel.replace_playlist_recording()
+            self.panel._apply_recording_choice(track["id"], candidate("https://soundcloud.com/artist/song", "SoundCloud", 3))
             self.assertTrue(shared.wait_until(lambda: not self.panel.replacing, 15), self.panel.status.text())
             requested = fetch.call_args[0][0]
             self.assertTrue(requested["search_by_name"])
@@ -184,7 +190,7 @@ class ReplacementIntegrationTests(unittest.TestCase):
         shared.write_beats(new, duration=3, amplitude=0.7)
         with patch.object(self.panel.jobs.downloader, "fetch", return_value={"path": str(new),
                 "resolved_url": "https://soundcloud.com/artist/new", "resolved_source": "SoundCloud"}):
-            self.panel.replace_playlist_recording()
+            self.panel._apply_recording_choice(track["id"], candidate("https://soundcloud.com/artist/new", "SoundCloud", 3))
             self.assertTrue(shared.wait_until(lambda: not self.panel.replacing and self.panel.player.state == "playing" and
                 self.backend.media.canonicalUrl().toLocalFile() != old_media, 12), self.panel.status.text())
         self.assertEqual(self.backend.clock, 0)

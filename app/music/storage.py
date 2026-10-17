@@ -15,13 +15,13 @@ SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".opus", ".aif", ".aiff
                         ".au", ".snd", ".caf", ".w64", ".rf64", ".wavex"}
 
 
-def atomic_json(path, data):
+def atomic_json(path, data, *, indent=2):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
         with temporary.open("w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, indent=2, allow_nan=False)
+            file.write(json.dumps(data, ensure_ascii=False, indent=indent, allow_nan=False))
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary, path)
@@ -75,7 +75,9 @@ class MusicLibrary:
 
     def save(self):
         with self.lock:
-            atomic_json(self.path, self.data)
+            # The compact encoder avoids walking every field in Python when a
+            # theme, volume or widget preference saves a large music library.
+            atomic_json(self.path, self.data, indent=None)
 
     def tracks(self):
         with self.lock:

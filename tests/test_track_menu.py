@@ -89,10 +89,12 @@ class TrackMenuTests(unittest.TestCase):
         self.assertIsNone(self.panel.library.track(identity))
         self.assertEqual(len(self.panel.library.playlists()[0]["tracks"]), 1)
 
-    def test_player_header_is_above_mode_selector_without_brand_label(self):
+    def test_player_header_is_first_and_mode_switch_is_in_footer_without_brand_label(self):
         layout = self.window.layout()
         self.assertIs(layout.itemAt(0).widget(), self.panel.player_header)
-        self.assertIs(layout.itemAt(1).layout().itemAt(0).widget(), self.window.light_source_combo)
+        self.assertIs(layout.itemAt(layout.count() - 1).widget(), self.window.footer)
+        self.assertIs(self.window.source_button.parent(), self.window.footer)
+        self.assertFalse(hasattr(self.window, "light_source_combo"))
         self.assertNotIn("Music Light", [label.text() for label in self.window.findChildren(QtWidgets.QLabel)])
 
 

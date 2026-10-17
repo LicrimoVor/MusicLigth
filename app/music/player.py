@@ -17,13 +17,13 @@ class PlaybackQueue:
     def current(self):
         return self.tracks[self.order[self.cursor]] if 0 <= self.cursor < len(self.order) else None
 
-    def set_tracks(self, tracks, start=0):
+    def set_tracks(self, tracks, start=0, *, ordered=False):
         self.tracks = list(tracks)
         self.order = list(range(len(tracks)))
         self.cursor = 0 if tracks else -1
         if tracks:
             start = max(0, min(len(tracks) - 1, start))
-            if self.shuffle:
+            if self.shuffle and not ordered:
                 self.order.remove(start)
                 self.rng.shuffle(self.order)
                 self.order.insert(0, start)
@@ -107,11 +107,11 @@ class MusicPlayer(QtCore.QObject):
         self.state = state
         self.playbackChanged.emit(state)
 
-    def set_queue(self, tracks, start=0):
+    def set_queue(self, tracks, start=0, *, ordered=False):
         self.clear_repeat()
         self.want_play = False
         self.backend.stop()
-        self.queue.set_tracks(tracks, start)
+        self.queue.set_tracks(tracks, start, ordered=ordered)
         self.failed_tracks.clear()
         self.prepared = None
         self.waiting = None
@@ -129,6 +129,25 @@ class MusicPlayer(QtCore.QObject):
             self.set_queue(tracks)
             if was_playing and tracks:
                 self.play()
+
+    def reorder_queue(self, tracks):
+        """Use an explicit playback order without shuffling it or restarting the current track."""
+        tracks = list(tracks)
+        current = self.current_track
+        if current not in tracks:
+            was_playing = self.want_play
+            remaining = set(tracks)
+            next_track = next((identity for identity in self.queue.ordered_tracks()[self.queue.cursor + 1:]
+                               if identity in remaining), None)
+            self.set_queue(tracks, tracks.index(next_track) if next_track else 0, ordered=True)
+            if was_playing and tracks:
+                self.play()
+            return
+        self.queue.tracks = tracks
+        self.queue.order = list(range(len(tracks)))
+        self.queue.cursor = tracks.index(current)
+        self.failed_tracks.intersection_update(tracks)
+        self.queueChanged.emit(self.queue.ordered_tracks())
 
     def play(self):
         if not self.current_track:

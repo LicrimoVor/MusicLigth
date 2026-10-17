@@ -68,12 +68,14 @@ class MusicJobs(QtCore.QThread):
     def analyse(self, track, settings, priority=False):
         self._enqueue("analysis", track["id"], (dict(track), settings), priority=priority)
 
-    def replace_recording(self, track, settings):
+    def replace_recording(self, track, settings, candidate=None):
         excluded = list(track.get("excluded_urls") or [])
         if track.get("resolved_url") and track["resolved_url"] not in excluded:
             excluded.append(track["resolved_url"])
         revision = int(track.get("download_revision") or 0) + 1
         replacement = dict(track) | {"search_by_name": True, "download_revision": revision, "excluded_urls": excluded}
+        if candidate:
+            replacement.update(remote=True, recording_choice=dict(candidate))
         self._enqueue("replacement", track["id"], (replacement, settings), priority=True)
 
     def import_playlists(self, paths):
@@ -200,9 +202,13 @@ class MusicJobs(QtCore.QThread):
                     timeline_path = self.generator.generate(result["cache_path"], settings, cancel,
                                                            lambda value, stage: report(90 + value * 0.1, stage))
                     if kind == "replacement":
-                        self.replacementReady.emit(identity, result | download | {"timeline_path": timeline_path,
+                        fields = {"timeline_path": timeline_path,
                             "search_by_name": True, "download_revision": track["download_revision"],
-                            "excluded_urls": track["excluded_urls"]})
+                            "excluded_urls": track["excluded_urls"]}
+                        if track.get("recording_choice"):
+                            fields.update(recording_choice=track["recording_choice"], remote=True,
+                                expected_duration=download.get("source_duration", result.get("duration", 0)))
+                        self.replacementReady.emit(identity, result | download | fields)
                     else:
                         self.analysed.emit(identity, result | {"timeline_path": timeline_path})
                 elif kind == "timeline":

@@ -1,6 +1,7 @@
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from core.const import LAMP_POSITION
+from ui.theme import colors
 
 
 class LampWidget(QtWidgets.QWidget):
@@ -64,14 +65,14 @@ class LampWidget(QtWidgets.QWidget):
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
         rect = self.rect()
-        painter.fillRect(rect, QtGui.QColor("#101418"))
+        painter.fillRect(rect, QtGui.QColor(colors()["plot"]))
 
         margin = 42
         field = rect.adjusted(margin, margin, -margin, -margin)
-        painter.setPen(QtGui.QPen(QtGui.QColor("#28323a"), 1))
+        painter.setPen(QtGui.QPen(QtGui.QColor(colors()["border"]), 1))
         painter.drawRoundedRect(field, 8, 8)
 
-        painter.setPen(QtGui.QPen(QtGui.QColor("#1e272e"), 1))
+        painter.setPen(QtGui.QPen(QtGui.QColor(colors()["grid"]), 1))
         for i in range(1, 4):
             x = field.left() + field.width() * i / 4
             y = field.top() + field.height() * i / 4

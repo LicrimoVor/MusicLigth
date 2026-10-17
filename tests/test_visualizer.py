@@ -101,9 +101,9 @@ class VisualizerTests(unittest.TestCase):
         self.window.queued_colors.clear()
         self.window.queued_options.clear()
         self.wait_sends()
-        self.window.close()
+        self.window.request_exit()
         self.window.music_panel.jobs.wait(2000)
-        self.window.close()
+        self.window.request_exit()
         self.app.processEvents()
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.loop_thread.join(timeout=2)
@@ -175,6 +175,7 @@ class VisualizerTests(unittest.TestCase):
     def test_close_waits_for_queued_off_without_blocking_event_loop(self):
         pending = self.block_sends()
         self.window.timer.start()
+        self.window._exit_requested = True
         event = QtGui.QCloseEvent()
         self.window.closeEvent(event)
         self.assertFalse(event.isAccepted())

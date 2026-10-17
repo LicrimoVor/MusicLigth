@@ -19,15 +19,24 @@ from model.settings import load_settings, normalize_profile, save_settings
 from ui.LampWidget import LampWidget
 from ui.MusicPanel import MusicPanel
 from ui.global_hotkeys import GlobalMediaKeys
+from ui.caption_buttons import CaptionButtons
+from ui.icons import icon
+from ui.SystemTray import SystemTray
+from ui.DesktopBeatWidget import DesktopBeatWidget
+from ui.DesktopMusicWidgets import DesktopMusicWidget, DesktopLyricsWidget
+from ui.theme import apply_theme
 from ui.widgets import BeatGraphWidget, ColorButton, SpectrumWidget
 
 
 class AudioVisualizer(QtWidgets.QWidget):
     diagnosticsReady = QtCore.pyqtSignal(list)
     lampUpdateFinished = QtCore.pyqtSignal()
+    lightSourceChanged = QtCore.pyqtSignal(str)
+    exitReady = QtCore.pyqtSignal()
 
     def __init__(self, tuya_controller: TuyaLampController = None, async_loop=None, music_root=None, music_backend=None):
         super().__init__()
+        self.caption_buttons = CaptionButtons(self)
         self.tuya_controller = tuya_controller
         self.async_loop = async_loop
         self.music_root = music_root
@@ -37,6 +46,7 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.queued_generations = {}
         self.inflight_generations = {}
         self.setWindowTitle("Music Light")
+        self.setWindowIcon(icon("app"))
         self.resize(1180, 780)
 
         self.settings = load_settings()
@@ -56,6 +66,8 @@ class AudioVisualizer(QtWidgets.QWidget):
         if self.tuya_controller:
             self.tuya_controller.set_update_rate(self.lamp_update_hz)
         self._closing = False
+        self._exit_requested = False
+        self._shutdown_complete = False
 
         self.device_ids = [device.id for device in (tuya_controller.devices if tuya_controller else [])]
         if not self.device_ids:
@@ -99,12 +111,42 @@ class AudioVisualizer(QtWidgets.QWidget):
 
         self.diagnosticsReady.connect(self.render_diagnostics)
         self.init_ui()
+        self.set_theme(self.music_panel.library.settings().get("theme", "dark"), persist=False)
         self.apply_loaded_settings()
-        self.hotkeys = GlobalMediaKeys(self)
+        widget_preferences = self.music_panel.library.settings().get("desktop_widget", {})
+        self.desktop_widget = DesktopBeatWidget(widget_preferences)
+        self.desktop_widget.apply_theme()
+        other_preferences = self.music_panel.library.settings().get("desktop_widgets", {})
+        other_preferences = other_preferences if isinstance(other_preferences, dict) else {}
+        self.desktop_widgets = {"beat": self.desktop_widget,
+            "music": DesktopMusicWidget(self.music_panel, other_preferences.get("music")),
+            "lyrics": DesktopLyricsWidget(self.music_panel, other_preferences.get("lyrics"))}
+        self.music_panel.lyricsUpdated.connect(self.desktop_widgets["lyrics"].refresh)
+        self.desktop_widgets["lyrics"].settingsChanged.connect(self.save_desktop_preferences)
+        for kind, widget in self.desktop_widgets.items():
+            widget.visibilityChanged.connect(self.widget_actions[kind].setChecked)
+            self.widget_actions[kind].toggled.connect(widget.set_enabled)
+            widget.visibilityChanged.connect(self.save_desktop_preferences)
+            widget.positionSaved.connect(self.save_desktop_preferences)
+        self.tray = SystemTray(self)
+        self._restoring_widgets = True
+        self.desktop_widget.set_enabled(bool(widget_preferences.get("enabled", False)) if isinstance(widget_preferences, dict) else False)
+        for kind in ("music", "lyrics"):
+            preference = other_preferences.get(kind, {})
+            self.desktop_widgets[kind].set_enabled(bool(preference.get("enabled", False)) if isinstance(preference, dict) else False)
+        self._restoring_widgets = False
+        self.hotkeys = GlobalMediaKeys(self, media_enabled=self.light_source == "player")
         self.hotkeys.activated.connect(self.on_global_media_key, QtCore.Qt.QueuedConnection)
+        self.hotkeys.errorChanged.connect(lambda message: self.music_panel.status.setText(message) if message else None)
+        self.lightSourceChanged.connect(lambda source: self.hotkeys.set_media_enabled(source == "player"))
         if self.hotkeys.error:
             self.music_panel.status.setText(self.hotkeys.error.strip())
         self.update_preview({}, np.zeros(SPECTRUM_BINS), 0.0, self.static_color)
+
+    def nativeEvent(self, event_type, message):
+        if hasattr(self, "caption_buttons") and self.caption_buttons.native_event(message):
+            return True, 0
+        return super().nativeEvent(event_type, message)
 
     def get_microphones(self):
         try:
@@ -145,23 +187,23 @@ class AudioVisualizer(QtWidgets.QWidget):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
-        header = QtWidgets.QHBoxLayout()
         self.connection_label = QtWidgets.QLabel(self.connection_summary())
         self.connection_label.setObjectName("muted")
-        self.light_source_combo = QtWidgets.QComboBox()
-        self.light_source_combo.addItem("Реальное время", "live")
-        self.light_source_combo.addItem("Музыка", "player")
-        self.light_source_combo.currentIndexChanged.connect(self.on_light_source_changed)
-        header.addWidget(self.light_source_combo)
-        header.addStretch(1)
-        header.addWidget(self.connection_label)
+        self.source_button = QtWidgets.QToolButton()
+        self.source_button.setCheckable(True)
+        self.source_button.setText("Реальное время")
+        self.source_button.setIcon(icon("live"))
+        self.source_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.source_button.setToolTip("Переключить источник света: реальное время / музыка")
+        self.source_button.setAccessibleName("Режим: реальное время")
+        self.source_button.toggled.connect(lambda checked: self.select_light_source("player" if checked else "live"))
 
         self.music_panel = MusicPanel(self.device_ids, self.tuya_controller, self.async_loop,
                                       root=self.music_root, backend=self.music_backend, parent=self)
         root.addWidget(self.music_panel.player_header)
         self.music_panel.player_header.show()
-        root.addLayout(header)
         self.tabs = QtWidgets.QTabWidget()
+        self.tabs.tabBar().setDrawBase(False)
         self.control_page = self.build_control_tab()
         self.beat_page = self.build_beat_tab()
         self.tabs.addTab(self.control_page, "Управление")
@@ -178,7 +220,51 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.music_panel.invalidateRequested.connect(self.invalidate_music_scene)
         self.music_panel.rateChanged.connect(self.on_music_rate_changed)
         root.addWidget(self.tabs, 1)
-        root.addWidget(self.music_panel)
+        self.footer = QtWidgets.QWidget()
+        footer = QtWidgets.QHBoxLayout(self.footer)
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.addWidget(self.source_button)
+        self.theme_button = QtWidgets.QToolButton()
+        self.theme_button.setCheckable(True)
+        self.theme_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.theme_button.setAccessibleName("Сменить тему")
+        self.theme_button.toggled.connect(lambda checked: self.set_theme("light" if checked else "dark"))
+        footer.addWidget(self.theme_button)
+        self.widgets_button = QtWidgets.QToolButton()
+        self.widgets_button.setText("Виджеты")
+        self.widgets_button.setIcon(icon("widgets"))
+        self.widgets_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.widgets_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.widgets_button.setAccessibleName("Виджеты рабочего стола")
+        self.widgets_menu = QtWidgets.QMenu(self.widgets_button)
+        self.widget_actions = {}
+        for kind, title in (("beat", "Бит"), ("music", "Музыка"), ("lyrics", "Текст")):
+            action = self.widgets_menu.addAction(title)
+            action.setCheckable(True)
+            self.widget_actions[kind] = action
+        self.widgets_button.setMenu(self.widgets_menu)
+        footer.addWidget(self.widgets_button)
+        footer.addWidget(self.music_panel, 1)
+        footer.addWidget(self.connection_label)
+        root.addWidget(self.footer)
+
+    def set_theme(self, theme, *, persist=True):
+        self.theme_name = "light" if theme == "light" else "dark"
+        apply_theme(self.theme_name)
+        with QtCore.QSignalBlocker(self.theme_button):
+            self.theme_button.setChecked(self.theme_name == "light")
+        self.theme_button.setText("Светлая" if self.theme_name == "light" else "Тёмная")
+        self.theme_button.setToolTip("Переключить светлую и тёмную тему")
+        self.theme_button.setIcon(icon("theme"))
+        self.source_button.setIcon(icon("music" if self.light_source == "player" else "live"))
+        self.widgets_button.setIcon(icon("widgets"))
+        self.music_panel.apply_theme()
+        for widget in getattr(self, "desktop_widgets", {}).values():
+            widget.apply_theme()
+        if hasattr(self, "tray"):
+            self.tray.sync()
+        if persist:
+            self.music_panel.library.update_settings({"theme": self.theme_name})
 
     def build_control_tab(self):
         self.control_stack = QtWidgets.QStackedWidget()
@@ -250,11 +336,18 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.player_control_layout.setSpacing(14)
         settings_scroll = QtWidgets.QScrollArea()
         settings_scroll.setWidgetResizable(True)
-        settings_scroll.setMinimumWidth(480)
-        settings_scroll.setMaximumWidth(600)
+        settings_scroll.setMinimumWidth(380)
+        settings_scroll.setMaximumWidth(430)
         settings_scroll.setWidget(self.music_panel.settings_page)
         self.music_panel.settings_page.show()
         self.player_control_layout.addWidget(settings_scroll)
+        self.music_colors_sidebar = QtWidgets.QScrollArea()
+        self.music_colors_sidebar.setWidgetResizable(True)
+        self.music_colors_sidebar.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.music_colors_sidebar.setFixedWidth(280)
+        self.music_colors_sidebar.setWidget(self.music_panel.music_colors_page)
+        self.music_panel.music_colors_page.show()
+        self.player_control_layout.addWidget(self.music_colors_sidebar)
         self.control_stack.addWidget(player_page)
         return self.control_stack
 
@@ -338,20 +431,7 @@ class AudioVisualizer(QtWidgets.QWidget):
         layout.setContentsMargins(0, 12, 0, 0)
         layout.setSpacing(10)
 
-        top = QtWidgets.QHBoxLayout()
-        self.beat_percent_label = QtWidgets.QLabel("Бит: 0%")
-        self.beat_percent_label.setObjectName("title")
-        self.beat_scale_hint = QtWidgets.QLabel(f"Масштаб: x{self.beat_scale:.2f}")
-        self.beat_scale_hint.setObjectName("muted")
-        clear_btn = QtWidgets.QPushButton("Очистить график")
-        clear_btn.clicked.connect(self.clear_beat_graph)
-        top.addWidget(self.beat_percent_label)
-        top.addWidget(self.beat_scale_hint)
-        top.addStretch(1)
-        top.addWidget(clear_btn)
-
         self.beat_graph_widget = BeatGraphWidget()
-        layout.addLayout(top)
         layout.addWidget(self.beat_graph_widget, 1)
         return page
 
@@ -634,7 +714,6 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.beat_scale = value / 100
         label = f"x{self.beat_scale:.2f}"
         self.beat_scale_label.setText(label)
-        self.beat_scale_hint.setText(f"Масштаб: {label}")
 
     def on_beat_threshold_changed(self, value):
         self.beat_threshold = value / 100
@@ -646,7 +725,8 @@ class AudioVisualizer(QtWidgets.QWidget):
 
     def clear_beat_graph(self):
         self.beat_graph_widget.clear()
-        self.beat_percent_label.setText("Бит: 0%")
+        if hasattr(self, "desktop_widget"):
+            self.desktop_widget.graph.clear()
 
     def on_quiet_color_changed(self, color):
         self.quiet_color = tuple(color)
@@ -1137,7 +1217,18 @@ class AudioVisualizer(QtWidgets.QWidget):
     def update_beat_graph(self, level, raw_level=None, onset=False, timestamp=None):
         level = clamp(level)
         self.beat_graph_widget.add_level(level, raw_level, onset, timestamp)
-        self.beat_percent_label.setText(f"Бит: {int(level * 100)}% · {self.beat_tier(level)}")
+        if self.desktop_widget.enabled:
+            analysis = self.music_panel.scheduler.analysis if self.light_source == "player" else None
+            tempo = analysis.tempo_at(self.music_panel.player.position_seconds()) if analysis else 0
+            self.desktop_widget.add_sample(level, raw_level, onset, timestamp, tempo)
+
+    def save_desktop_preferences(self, *_args):
+        if getattr(self, "_restoring_widgets", False):
+            return
+        widget = self.desktop_widget
+        self.music_panel.library.update_settings({"desktop_widget": {"enabled": widget.enabled,
+            "position": [widget.x(), widget.y()]}, "desktop_widgets": {
+                kind: self.desktop_widgets[kind].preferences() for kind in ("music", "lyrics")}})
 
     def send_colors(self, colors, brightness, *, music=True, source="live"):
         if source != self.light_source:
@@ -1209,9 +1300,14 @@ class AudioVisualizer(QtWidgets.QWidget):
             self.lamp_timer.stop()
 
     def select_light_source(self, source):
-        index = self.light_source_combo.findData(source)
-        if index >= 0:
-            self.light_source_combo.setCurrentIndex(index)
+        if source not in ("live", "player"):
+            return
+        with QtCore.QSignalBlocker(self.source_button):
+            self.source_button.setChecked(source == "player")
+        self.source_button.setText("Музыка" if source == "player" else "Реальное время")
+        self.source_button.setIcon(icon("music" if source == "player" else "live"))
+        self.source_button.setAccessibleName("Режим: " + self.source_button.text())
+        self.on_light_source_changed(source)
 
     def invalidate_light_scene(self):
         self.light_generation += 1
@@ -1226,8 +1322,7 @@ class AudioVisualizer(QtWidgets.QWidget):
         if self.light_source == "player" and not self._closing:
             self.invalidate_light_scene()
 
-    def on_light_source_changed(self):
-        source = self.light_source_combo.currentData()
+    def on_light_source_changed(self, source):
         if source == self.light_source:
             return
         if self.light_source == "live":
@@ -1240,20 +1335,20 @@ class AudioVisualizer(QtWidgets.QWidget):
         self.clear_beat_graph()
         if source == "player":
             self.live_control_layout.removeWidget(self.visual_panel)
-            self.player_control_layout.addWidget(self.visual_panel, 1)
+            self.player_control_layout.insertWidget(1, self.visual_panel, 1)
             self.control_stack.setCurrentIndex(1)
-            self.beat_scale_hint.setText("Анализ композиции · 50 Гц")
             self.lamp_widget.set_selected_lamps(self.music_panel.settings["lamp_ids"])
         else:
             self.player_control_layout.removeWidget(self.visual_panel)
             self.live_control_layout.insertWidget(1, self.visual_panel, 1)
             self.control_stack.setCurrentIndex(0)
-            self.beat_scale_hint.setText(f"Масштаб: x{self.beat_scale:.2f}")
             if self.tuya_controller:
                 self.tuya_controller.set_update_rate(self.lamp_update_hz)
             self.lamp_widget.set_selected_lamps(self.active_lamps)
         self.visual_panel.show()
         self.connection_label.setText(self.connection_summary())
+        self.lightSourceChanged.emit(source)
+        self.desktop_widget.set_source(source)
 
     def on_music_rate_changed(self, rate):
         if self.light_source == "player" and self.tuya_controller:
@@ -1289,6 +1384,15 @@ class AudioVisualizer(QtWidgets.QWidget):
             self.music_panel.player.previous(force=True)
         elif action == "next":
             self.music_panel.player.next()
+        elif self.light_source == "player":
+            if action == "play_pause":
+                self.music_panel.toggle_playback()
+            elif action == "play" and not self.music_panel.player.want_play:
+                self.music_panel.play()
+            elif action == "pause":
+                self.music_panel.player.pause()
+            elif action == "stop":
+                self.music_panel.player.stop()
 
     def refresh_diagnostics(self):
         if not self.tuya_controller or not self.async_loop:
@@ -1374,9 +1478,23 @@ class AudioVisualizer(QtWidgets.QWidget):
         text = json.dumps(status, ensure_ascii=False)
         return text if len(text) <= 180 else text[:177] + "..."
 
+    def request_exit(self):
+        self._exit_requested = True
+        self.close()
+
     def closeEvent(self, event):
+        if not self._exit_requested and not self._closing and QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            event.ignore()
+            self.save_current_settings()
+            self.music_panel.save_preferences()
+            self.tray.tray.show()
+            self.hide()
+            return
         if not self._closing:
             self._closing = True
+            for widget in self.desktop_widgets.values():
+                widget.shutdown()
+            self.tray.close()
             self.hotkeys.close()
             self.setEnabled(False)
             self.save_current_settings()
@@ -1393,3 +1511,6 @@ class AudioVisualizer(QtWidgets.QWidget):
             return
         self.lamp_timer.stop()
         event.accept()
+        if not self._shutdown_complete:
+            self._shutdown_complete = True
+            self.exitReady.emit()

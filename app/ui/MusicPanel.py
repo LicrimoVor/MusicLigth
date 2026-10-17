@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 import random
 import uuid
+import unicodedata
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -15,6 +16,12 @@ from music.storage import DEFAULT_MUSIC_DIR, MusicLibrary, SUPPORTED_EXTENSIONS
 from music.timeline import PRESETS, show_settings, timeline_key
 from ui.PlaylistTable import PlaylistTable
 from ui.ImportDialog import ImportDialog
+from ui.MusicFileDialog import MusicFileDialog
+from ui.icons import icon
+from ui.widgets import ColorButton
+from ui.theme import colors
+from ui.LyricsDialog import LyricsDialog
+from ui.RecordingDialog import RecordingDialog
 
 
 def duration_text(seconds):
@@ -22,6 +29,59 @@ def duration_text(seconds):
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours}:{minutes:02}:{seconds:02}" if hours else f"{minutes}:{seconds:02}"
+
+
+class PlaylistTabBar(QtWidgets.QTabBar):
+    def keep_now_first(self, *_args):
+        if getattr(self, "_pinning", False):
+            return
+        for index in range(self.count()):
+            if self.tabData(index) == "now" and index > 0:
+                self._pinning = True
+                try:
+                    self.moveTab(index, 0)
+                finally:
+                    self._pinning = False
+                break
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setPen(QtGui.QPen(QtGui.QColor(colors()["accent"]), 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+        for index in range(self.count()):
+            if self.tabData(index) == "now":
+                rect = self.tabRect(index)
+                painter.drawLine(rect.left() + 10, rect.bottom() - 2, rect.right() - 10, rect.bottom() - 2)
+
+
+class AnalysisProgressDelegate(QtWidgets.QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        value = index.data(QtCore.Qt.UserRole)
+        if value is None:
+            return super().paint(painter, option, index)
+        # Only visible cells are painted; thousands of tracks need no child widgets.
+        background = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(background, index)
+        background.text = ""
+        style = option.widget.style() if option.widget else QtWidgets.QApplication.style()
+        style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, background, painter, option.widget)
+        text = f"{value}%"
+        text_width = option.fontMetrics.horizontalAdvance("100%") + 8
+        rect = QtCore.QRectF(option.rect.adjusted(8, 11, -text_width - 8, -11))
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(colors()["grid"]))
+        painter.drawRoundedRect(rect, 3, 3)
+        filled = QtCore.QRectF(rect)
+        filled.setWidth(rect.width() * max(0, min(100, value)) / 100)
+        painter.setBrush(QtGui.QColor(colors()["accent"]))
+        painter.drawRoundedRect(filled, 3, 3)
+        painter.setPen(QtGui.QColor(colors()["text"]))
+        painter.setFont(option.font)
+        painter.drawText(option.rect.adjusted(0, 0, -6, 0), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, text)
+        painter.restore()
 
 
 class LibraryTable(QtWidgets.QTableWidget):
@@ -33,8 +93,9 @@ class LibraryTable(QtWidgets.QTableWidget):
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.setHorizontalHeaderLabels(["Название", "Исполнитель", "Альбом", "Длительность", "BPM", "Анализ", "Прогресс"])
+        self.setHorizontalHeaderLabels(["Название", "Исполнитель", "Плейлист", "Длительность", "BPM", "Анализ", "Прогресс"])
         self.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.setItemDelegateForColumn(6, AnalysisProgressDelegate(self))
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -52,6 +113,7 @@ class LibraryTable(QtWidgets.QTableWidget):
 
 
 class MusicPanel(QtWidgets.QWidget):
+    lyricsUpdated = QtCore.pyqtSignal()
     sourceRequested = QtCore.pyqtSignal(str)
     colorsReady = QtCore.pyqtSignal(dict)
     previewReady = QtCore.pyqtSignal(object, float, object)
@@ -78,6 +140,9 @@ class MusicPanel(QtWidgets.QWidget):
         self.measure_future = None
         self.import_dialog = None
         self.text_import_dialog = None
+        self.lyrics_dialog = None
+        self.recording_dialog = None
+        self.recording_dialogs = set()
         self.replacing = set()
         self.player = MusicPlayer(self.library.track, self, backend)
         self.player.queue.repeat = "off"
@@ -153,13 +218,14 @@ class MusicPanel(QtWidgets.QWidget):
         self.playlists_page = self._build_playlists()
         self.player_header = self._build_player_header()
         self.settings_page = self._build_settings()
-        for page in (self.library_page, self.playlists_page, self.player_header, self.settings_page):
+        for page in (self.library_page, self.playlists_page, self.player_header, self.settings_page, self.music_colors_page):
             page.setParent(self)
             page.hide()
         bottom = QtWidgets.QHBoxLayout()
         self.status = QtWidgets.QLabel("Добавьте музыку: анализ и световой таймлайн создаются автоматически")
         self.status.setWordWrap(True)
         self.queue_status = QtWidgets.QLabel("Задач в очереди: 0")
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         bottom.addWidget(self.status, 1)
         bottom.addWidget(self.queue_status)
         layout.addLayout(bottom)
@@ -168,10 +234,16 @@ class MusicPanel(QtWidgets.QWidget):
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(page)
         row = QtWidgets.QHBoxLayout()
-        for label, callback in (("Добавить файлы", self.choose_files), ("Добавить папку", self.choose_directory),
-                                ("Удалить", self.remove_selected), ("Отменить анализ", self.cancel_selected),
-                                ("Повторить анализ", self.retry_selected), ("Play", self.play_library_selection)):
-            row.addWidget(self._button(label, callback))
+        self.add_music_button = self._button("Добавить", self.choose_music)
+        self.add_music_button.setIcon(icon("folder-add"))
+        self.add_music_button.setToolTip("Выберите файлы или папки с музыкой; их также можно перетащить в таблицу")
+        row.addWidget(self.add_music_button)
+        self.library_search = QtWidgets.QLineEdit()
+        self.library_search.setPlaceholderText("Поиск по названию, исполнителю, плейлисту…")
+        self.library_search.setAccessibleName("Поиск музыки")
+        self.library_search.setClearButtonEnabled(True)
+        self.library_search.textChanged.connect(self._filter_library)
+        row.addWidget(self.library_search, 1)
         layout.addLayout(row)
         self.library_table = LibraryTable()
         self._connect_track_menu(self.library_table)
@@ -190,21 +262,49 @@ class MusicPanel(QtWidgets.QWidget):
     def _build_playlists(self):
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(page)
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self._button("Создать", self.create_playlist))
-        row.addWidget(self._button("Удалить плейлист", self.delete_playlist))
-        row.addWidget(self._button("Play playlist", self.play_playlist))
-        row.addWidget(self._button("Микс", lambda: self.play_playlist(mix=True)))
-        row.addWidget(self._button("Импорт", self.open_import))
-        row.addWidget(self._button("Добавить файлы", lambda: self.choose_files(self.selected_playlist)))
-        row.addStretch(1)
-        layout.addLayout(row)
         self.playlist_lists = {}
+        self._auto_playlist_selected = False
+        self._now_order = None
+        self._now_current = None
         self.empty_playlist_list = PlaylistTable(self)
         self.empty_playlist_list.hide()
         self.playlist_tracks = self.empty_playlist_list
         self.playlist_tabs = QtWidgets.QTabWidget()
+        tab_bar = PlaylistTabBar()
+        tab_bar.setDrawBase(False)
+        self.playlist_tabs.setTabBar(tab_bar)
+        tab_bar.tabMoved.connect(tab_bar.keep_now_first)
         self.playlist_tabs.setMovable(True)
+        self.playlist_tabs.tabBar().setExpanding(False)
+        self.playlist_tabs.setUsesScrollButtons(True)
+        self.playlist_toolbar = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(self.playlist_toolbar)
+        row.setContentsMargins(8, 0, 0, 0)
+        row.setSpacing(4)
+        self.playlist_buttons = {}
+        for name, title, callback in (
+                ("add", "Создать плейлист", self.create_playlist),
+                ("delete", "Удалить плейлист", self.delete_playlist),
+                ("shuffle", "Микс", lambda: self.play_playlist(mix=True)),
+                ("import", "Импорт", self.open_import),
+                ("folder-add", "Добавить файлы или папки", lambda: self.choose_music(self.selected_playlist or self.active_playlist))):
+            button = QtWidgets.QToolButton()
+            button.setIcon(icon(name))
+            button.setToolTip(title)
+            button.setAccessibleName(title)
+            button.setFixedSize(34, 34)
+            button.clicked.connect(lambda _checked=False, action=callback: action())
+            self.playlist_buttons[name] = button
+            row.addWidget(button)
+        self.playlist_tabs.setCornerWidget(self.playlist_toolbar, QtCore.Qt.TopRightCorner)
+        self.now_table = PlaylistTable()
+        self.now_table.setProperty("is_now", True)
+        self.now_table.orderChanged.connect(self._now_order_changed)
+        self.now_table.cellDoubleClicked.connect(lambda row, _column: self._play_queue_row(row))
+        self._connect_track_menu(self.now_table)
+        self.playlist_tabs.addTab(self.now_table, icon("music"), "Now")
+        tab_bar.setTabData(0, "now")
+        tab_bar.setTabTextColor(0, QtGui.QColor(colors()["accent"]))
         self.playlist_tabs.currentChanged.connect(self._playlist_tab_changed)
         layout.addWidget(self.playlist_tabs)
         hint = QtWidgets.QLabel("Двойной щелчок: найти → скачать → проанализировать → играть. Скачанные треки доступны без сети.")
@@ -272,11 +372,25 @@ class MusicPanel(QtWidgets.QWidget):
         self.repeat_button.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.repeat_button.customContextMenuRequested.connect(lambda _point: self.player.clear_repeat())
         self._repeat_changed(0)
-        self.shuffle_check = QtWidgets.QCheckBox("Микс")
+        self.shuffle_check = QtWidgets.QToolButton()
+        self.shuffle_check.setObjectName("shuffleButton")
+        self.shuffle_check.setCheckable(True)
+        self.shuffle_check.setFixedSize(34, 34)
+        self.shuffle_check.setAccessibleName("Микс")
         self.shuffle_check.setChecked(self.player.queue.shuffle)
         self.shuffle_check.toggled.connect(self._shuffle_changed)
+        self._update_shuffle_icon()
         header.addWidget(self.repeat_button)
         header.addWidget(self.shuffle_check)
+        self.lyrics_button = QtWidgets.QToolButton()
+        self.lyrics_button.setText("Т")
+        self.lyrics_button.setToolTip("Текст песни")
+        self.lyrics_button.setAccessibleName("Текст песни")
+        self.lyrics_button.setCheckable(True)
+        self.lyrics_button.setFixedSize(34, 34)
+        self.lyrics_button.setEnabled(False)
+        self.lyrics_button.clicked.connect(self.toggle_lyrics)
+        header.addWidget(self.lyrics_button)
         self.queue_button = QtWidgets.QToolButton()
         self.queue_button.setText("Очередь")
         self.queue_button.setCheckable(True)
@@ -318,7 +432,7 @@ class MusicPanel(QtWidgets.QWidget):
         painter = QtGui.QPainter(pixmap)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         painter.setPen(QtCore.Qt.NoPen)
-        painter.setBrush(QtGui.QColor("#edf2f7"))
+        painter.setBrush(QtGui.QColor(colors()["text"]))
         if kind == QtWidgets.QStyle.SP_MediaPlay:
             points = [(6, 3), (17, 10), (6, 17)]
         elif kind == QtWidgets.QStyle.SP_MediaPause:
@@ -329,7 +443,7 @@ class MusicPanel(QtWidgets.QWidget):
             painter.drawRoundedRect(QtCore.QRectF(4, 4, 12, 12), 1, 1)
             points = []
         elif kind == QtWidgets.QStyle.SP_BrowserReload:
-            painter.setPen(QtGui.QPen(QtGui.QColor("#edf2f7"), 2))
+            painter.setPen(QtGui.QPen(QtGui.QColor(colors()["text"]), 2))
             painter.drawArc(QtCore.QRectF(3, 4, 14, 13), 45 * 16, 280 * 16)
             painter.setPen(QtCore.Qt.NoPen)
             points = [(17, 2), (17, 9), (11, 5)]
@@ -349,6 +463,36 @@ class MusicPanel(QtWidgets.QWidget):
             self.player.pause()
         else:
             self.play()
+
+    def toggle_lyrics(self):
+        if self.lyrics_dialog and self.lyrics_dialog.isVisible():
+            self.lyrics_dialog.close()
+            return
+        track = self.library.track(self.player.current_track)
+        if not track:
+            self.lyrics_button.setChecked(False)
+            return
+        if self.lyrics_dialog is None:
+            self.lyrics_dialog = LyricsDialog(self.library.root, self.window())
+            self.lyrics_dialog.finished.connect(lambda _result: self.lyrics_button.setChecked(False))
+            self.lyrics_dialog.seekRequested.connect(self._seek_lyrics)
+            self.lyrics_dialog.loaded.connect(lambda: self._update_lyrics_position(self.player.position_seconds()))
+            self.lyrics_dialog.loaded.connect(self.lyricsUpdated)
+        self.lyrics_dialog.show()
+        self.lyrics_dialog.set_track(track)
+        self.lyrics_dialog.raise_()
+        self.lyrics_dialog.activateWindow()
+        self.lyrics_button.setChecked(True)
+        self._update_lyrics_position(self.player.position_seconds())
+
+    def _update_lyrics_position(self, position):
+        dialog = self.lyrics_dialog
+        if dialog and dialog.track and dialog.track["id"] == self.player.current_track and self.player.waiting is None:
+            dialog.set_position(position)
+
+    def _seek_lyrics(self, seconds):
+        if self.lyrics_dialog.track["id"] == self.player.current_track:
+            self.player.seek(seconds)
 
     def _build_settings(self):
         page = QtWidgets.QWidget()
@@ -379,6 +523,27 @@ class MusicPanel(QtWidgets.QWidget):
                               ("Компенсация задержки", self.latency_spin)):
             form.addRow(label, widget)
         layout.addLayout(form)
+        self.music_colors_page = QtWidgets.QWidget()
+        sidebar_layout = QtWidgets.QVBoxLayout(self.music_colors_page)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        colors_group = QtWidgets.QGroupBox("Цвета музыки")
+        sidebar_layout.addWidget(colors_group)
+        sidebar_layout.addStretch(1)
+        colors_layout = QtWidgets.QVBoxLayout(colors_group)
+        self.music_color_mode = QtWidgets.QComboBox()
+        self.music_color_mode.addItem("Автоматические цвета", "auto")
+        self.music_color_mode.addItem("Своя палитра", "custom")
+        self.music_color_mode.setCurrentIndex(self.music_color_mode.findData(self.settings["color_mode"]))
+        colors_layout.addWidget(self.music_color_mode)
+        color_row = QtWidgets.QVBoxLayout()
+        self.music_color_buttons = []
+        for title, color in zip(("Низкие", "Средние", "Высокие"), self.settings["palette"]):
+            button = ColorButton(title, color)
+            button.colorChanged.connect(self._music_color_changed)
+            self.music_color_buttons.append(button)
+            color_row.addWidget(button)
+        colors_layout.addLayout(color_row)
+        self.music_color_mode.currentIndexChanged.connect(self._settings_changed)
         row = QtWidgets.QHBoxLayout()
         self.group_combo = QtWidgets.QComboBox()
         row.addWidget(QtWidgets.QLabel("Группа ламп"))
@@ -416,9 +581,6 @@ class MusicPanel(QtWidgets.QWidget):
             self.offset_spins[lamp] = offset
             self.lamp_table.setCellWidget(row, 4, offset)
         layout.addWidget(self.lamp_table, 1)
-        hint = QtWidgets.QLabel("Положительная компенсация отправляет свет заранее. Измерение оценивает половину сетевого RTT; реакцию лампы можно уточнить вручную.")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
         self._refresh_groups()
         self.group_combo.currentIndexChanged.connect(self._group_selected)
         self.lamp_table.itemChanged.connect(self._lamp_item_changed)
@@ -429,33 +591,78 @@ class MusicPanel(QtWidgets.QWidget):
 
     def selected_track_ids(self):
         return [self.library_table.item(index.row(), 0).data(QtCore.Qt.UserRole)
-                for index in self.library_table.selectionModel().selectedRows()]
+                for index in self.library_table.selectionModel().selectedRows()
+                if not self.library_table.isRowHidden(index.row())]
+
+    @staticmethod
+    def _search_text(value):
+        return unicodedata.normalize("NFKC", str(value)).casefold().replace("ё", "е")
+
+    def _playlist_membership(self):
+        membership = {}
+        for playlist in self.library.playlists():
+            for identity in playlist["tracks"]:
+                membership.setdefault(identity, []).append(playlist["name"])
+        return membership
+
+    def _set_library_search_data(self, row, track):
+        text = " ".join(str(value) for value in track.values() if value is not None)
+        text += " " + " ".join(self.library_table.item(row, column).text() for column in range(6))
+        self.library_table.item(row, 0).setData(QtCore.Qt.UserRole + 1, self._search_text(text))
+
+    def _filter_library(self, *_args):
+        words = self._search_text(self.library_search.text()).split()
+        for row in range(self.library_table.rowCount()):
+            self._filter_library_row(row, words)
+
+    def _filter_library_row(self, row, words):
+        text = self.library_table.item(row, 0).data(QtCore.Qt.UserRole + 1) or ""
+        hidden = not all(word in text for word in words)
+        if hidden and self.library_table.selectionModel().isRowSelected(row, QtCore.QModelIndex()):
+            self.library_table.selectionModel().select(self.library_table.model().index(row, 0),
+                QtCore.QItemSelectionModel.Deselect | QtCore.QItemSelectionModel.Rows)
+        self.library_table.setRowHidden(row, hidden)
+
+    def _refresh_library_membership(self):
+        membership = self._playlist_membership()
+        for row in range(self.library_table.rowCount()):
+            identity = self.library_table.item(row, 0).data(QtCore.Qt.UserRole)
+            names = ", ".join(membership.get(identity, [])) or "—"
+            item = self.library_table.item(row, 2)
+            item.setText(names)
+            item.setToolTip(names)
+            self._set_library_search_data(row, self._library_tracks[identity])
+        self._filter_library()
 
     def refresh_library(self):
         selected = set(self.selected_track_ids()) if self.library_table.rowCount() else set()
         tracks = self.library.tracks()
+        self._library_tracks = {track["id"]: track for track in tracks}
+        membership = self._playlist_membership()
         self.library_table.setRowCount(len(tracks))
         for row, track in enumerate(tracks):
             bpm = f"{track.get('bpm', 0):.1f}" if track.get("bpm") else "—"
-            values = [track["title"], track.get("artist") or "—", track.get("album") or "—",
+            values = [track["title"], track.get("artist") or "—", ", ".join(membership.get(track["id"], [])) or "—",
                       duration_text(track.get("duration", 0)), bpm, track["status"]]
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(str(value))
-                item.setToolTip(track.get("error") or track["path"])
+                item.setToolTip(str(value) if column == 2 else track.get("error") or track["path"])
                 if column == 0:
                     item.setData(QtCore.Qt.UserRole, track["id"])
                 self.library_table.setItem(row, column, item)
-            if track["status"] == "NotDownloaded":
-                self.library_table.removeCellWidget(row, 6)
-                self.library_table.setItem(row, 6, QtWidgets.QTableWidgetItem("—"))
-            else:
-                bar = QtWidgets.QProgressBar()
-                bar.setRange(0, 100)
-                bar.setValue(int(track.get("progress", 0)))
-                self.library_table.setCellWidget(row, 6, bar)
+            progress = QtWidgets.QTableWidgetItem("—")
+            if track["status"] != "NotDownloaded":
+                value = int(track.get("progress", 0))
+                progress.setData(QtCore.Qt.UserRole, value)
+                progress.setToolTip(f"{value}%")
+                progress.setData(QtCore.Qt.AccessibleTextRole, f"{value}%")
+            self.library_table.setItem(row, 6, progress)
             if track["id"] in selected:
                 self.library_table.selectionModel().select(self.library_table.model().index(row, 0),
                     QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+            self._set_library_search_data(row, track)
+        self._filter_library()
+        self._refresh_now(refresh_metadata=True)
 
     def refresh_playlists(self):
         self.building = True
@@ -488,8 +695,13 @@ class MusicPanel(QtWidgets.QWidget):
             self.playlist_tabs.setTabText(self.playlist_tabs.indexOf(widget), playlist["name"])
         if self.selected_playlist in self.playlist_lists:
             self.playlist_tabs.setCurrentWidget(self.playlist_lists[self.selected_playlist])
+            self._auto_playlist_selected = True
+        elif playlists and not self._auto_playlist_selected:
+            self.playlist_tabs.setCurrentWidget(self.playlist_lists[playlists[0]["id"]])
+            self._auto_playlist_selected = True
         self.building = False
         self._playlist_selected()
+        self._refresh_library_membership()
 
     def _playlist_tab_changed(self, index):
         if self.building or index < 0:
@@ -513,6 +725,13 @@ class MusicPanel(QtWidgets.QWidget):
         if self.building:
             return
         widget = self.playlist_tabs.currentWidget()
+        if widget is self.now_table:
+            self.selected_playlist = None
+            self.playlist_tracks = self.now_table
+            self.playlist_buttons["delete"].setEnabled(False)
+            self._refresh_now()
+            return
+        self.playlist_buttons["delete"].setEnabled(True)
         self.selected_playlist = widget.property("playlist_id") if widget else None
         playlist = next((item for item in self.library.playlists() if item["id"] == self.selected_playlist), None)
         self.building = True
@@ -524,6 +743,10 @@ class MusicPanel(QtWidgets.QWidget):
             tracks = {track["id"]: track for track in self.library.tracks()}
             self.playlist_tracks.fill(playlist["tracks"], tracks)
         self.building = False
+
+    def choose_music(self, playlist_id=None):
+        extensions = " ".join("*" + extension for extension in sorted(SUPPORTED_EXTENSIONS))
+        self._open_import_dialog(QtWidgets.QFileDialog.ExistingFiles, f"Аудио ({extensions})", playlist_id or None, mixed=True)
 
     def choose_files(self, playlist_id=None):
         extensions = " ".join("*" + extension for extension in sorted(SUPPORTED_EXTENSIONS))
@@ -592,14 +815,16 @@ class MusicPanel(QtWidgets.QWidget):
     def choose_directory(self):
         self._open_import_dialog(QtWidgets.QFileDialog.Directory)
 
-    def _open_import_dialog(self, mode, name_filter=None, playlist_id=None, import_playlist=False):
+    def _open_import_dialog(self, mode, name_filter=None, playlist_id=None, import_playlist=False, mixed=False):
         if self.closing:
             return
         if self.import_dialog is not None:
             self.import_dialog.raise_()
             self.import_dialog.activateWindow()
             return
-        dialog = QtWidgets.QFileDialog(self, "Папка с музыкой" if mode == QtWidgets.QFileDialog.Directory else "Добавить музыку")
+        dialog_type = MusicFileDialog if mixed else QtWidgets.QFileDialog
+        dialog = dialog_type(self, "Файлы или папки с музыкой" if mixed else
+                             "Папка с музыкой" if mode == QtWidgets.QFileDialog.Directory else "Добавить музыку")
         # The Windows shell dialog can hang while enumerating shell extensions
         # and network locations. Qt's file model enumerates directories in a worker.
         dialog.setOption(QtWidgets.QFileDialog.DontUseNativeDialog, True)
@@ -609,6 +834,9 @@ class MusicPanel(QtWidgets.QWidget):
             dialog.setOption(QtWidgets.QFileDialog.ShowDirsOnly, True)
         if name_filter:
             dialog.setNameFilter(name_filter)
+        if mixed:
+            dialog.setLabelText(QtWidgets.QFileDialog.Accept, "Добавить")
+            dialog.setLabelText(QtWidgets.QFileDialog.FileName, "Файлы или папки:")
         if import_playlist:
             dialog.setWindowTitle("Импорт плейлиста из HTML / JSON")
             dialog.filesSelected.connect(self.jobs.import_playlists)
@@ -665,16 +893,18 @@ class MusicPanel(QtWidgets.QWidget):
             for item in self.library.data["tracks"]:
                 if item["id"] == track_id:
                     item.update(status="Analyzing", progress=percent)
-                    for table in self.playlist_lists.values():
+                    for table in self._track_tables():
                         table.update_track(item)
             for row in range(self.library_table.rowCount()):
                 if self.library_table.item(row, 0).data(QtCore.Qt.UserRole) == track_id:
                     self.library_table.item(row, 5).setText("Analyzing")
-                    bar = self.library_table.cellWidget(row, 6)
-                    if bar is None:
-                        bar = QtWidgets.QProgressBar()
-                        self.library_table.setCellWidget(row, 6, bar)
-                    bar.setValue(percent)
+                    progress = self.library_table.item(row, 6)
+                    progress.setData(QtCore.Qt.UserRole, percent)
+                    progress.setToolTip(f"{percent}%")
+                    progress.setData(QtCore.Qt.AccessibleTextRole, f"{percent}%")
+                    self._library_tracks[track_id] = track | {"status": "Analyzing", "progress": percent}
+                    self._set_library_search_data(row, self._library_tracks[track_id])
+                    self._filter_library_row(row, self._search_text(self.library_search.text()).split())
         self.status.setText(f"{track['title']}: {stage} · {percent}%")
 
     def _analysed(self, track_id, metadata):
@@ -684,7 +914,7 @@ class MusicPanel(QtWidgets.QWidget):
                   "tempo_confidence", "content_id", "cache_path", "playback_path", "cover_path", "timeline_path")}
         for key in ("path", "resolved_url", "resolved_title", "resolved_source", "source_codec", "source_bitrate_kbps",
                     "source_sample_rate", "source_duration", "search_query", "selection_version", "search_by_name",
-                    "download_revision", "excluded_urls"):
+                    "download_revision", "excluded_urls", "recording_choice", "expected_duration", "remote"):
             if key in metadata:
                 fields[key] = metadata[key]
         custom_title = self.library.track(track_id).get("custom_title")
@@ -761,6 +991,7 @@ class MusicPanel(QtWidgets.QWidget):
         if not index.isValid():
             return None
         playlist_id = table.property("playlist_id")
+        is_now = bool(table.property("is_now"))
         if playlist_id:
             self.playlist_tabs.setCurrentWidget(table)
         if not table.selectionModel().isRowSelected(index.row(), QtCore.QModelIndex()):
@@ -769,23 +1000,36 @@ class MusicPanel(QtWidgets.QWidget):
         identities = [table.item(item.row(), 0).data(QtCore.Qt.UserRole)
                       for item in table.selectionModel().selectedRows()]
         menu = QtWidgets.QMenu(table)
-        menu.addAction("Воспроизвести", self.play_playlist if playlist_id else self.play_library_selection)
+        play = (lambda: self._play_queue_row(table.currentRow())) if is_now else self.play_playlist if playlist_id else self.play_library_selection
+        menu.addAction("Воспроизвести", play)
+        playlists_menu = menu.addMenu("Добавить в плейлист")
+        playlists = self.library.playlists()
+        if not playlists:
+            playlists_menu.addAction("Нет плейлистов").setEnabled(False)
+        for playlist in playlists:
+            action = playlists_menu.addAction(playlist["name"])
+            action.setEnabled(any(identity not in playlist["tracks"] for identity in identities))
+            action.triggered.connect(lambda _checked=False, target=playlist["id"]:
+                                     self._add_tracks_to_playlist(identities, target))
         rename = menu.addAction("Переименовать", lambda: self.rename_track(identities[0]))
         rename.setEnabled(len(identities) == 1)
         menu.addAction("Проанализировать", lambda: self._analyse_tracks(identities))
         menu.addAction("Отменить анализ", lambda: self._cancel_tracks(identities))
         replacement = menu.addAction("Другая запись", lambda: self._replace_recordings(identities))
-        replacement.setEnabled(any((track := self.library.track(identity)) and track.get("remote")
-                                  and track.get("path") and track["status"] in ("Ready", "Error")
+        replacement.setEnabled(len(identities) == 1 and any((track := self.library.track(identity))
+                                  and track["status"] in ("Ready", "Error", "NotDownloaded")
                                   and identity not in self.replacing for identity in identities))
-        if playlist_id:
+        if playlist_id or is_now:
             menu.addSeparator()
             up = menu.addAction("Выше", lambda: self.move_playlist_track(-1))
             down = menu.addAction("Ниже", lambda: self.move_playlist_track(1))
             up.setEnabled(len(identities) == 1 and index.row() > 0)
             down.setEnabled(len(identities) == 1 and index.row() < table.rowCount() - 1)
         menu.addSeparator()
-        if playlist_id:
+        if is_now:
+            menu.addAction("Удалить из очереди", lambda: self.player.reorder_queue(
+                [identity for identity in self.player.queue.ordered_tracks() if identity not in identities]))
+        elif playlist_id:
             menu.addAction("Удалить из плейлиста", self.remove_playlist_track)
         else:
             menu.addAction("Удалить из библиотеки", lambda: self._remove_tracks(identities))
@@ -806,6 +1050,9 @@ class MusicPanel(QtWidgets.QWidget):
             self.now_title.setToolTip(title.strip())
         self._queue_changed(self.player.queue.ordered_tracks())
 
+        if self.lyrics_dialog and self.lyrics_dialog.isVisible() and self.player.current_track == track_id:
+            self.lyrics_dialog.set_track(self.library.track(track_id))
+
     def replace_library_recording(self):
         self._replace_recordings(self.selected_track_ids())
 
@@ -816,17 +1063,47 @@ class MusicPanel(QtWidgets.QWidget):
         self._replace_recordings(identities)
 
     def _replace_recordings(self, identities):
-        queued = 0
-        for identity in dict.fromkeys(identities):
-            track = self.library.track(identity)
-            if (not track or not track.get("remote") or not track.get("path")
-                    or identity in self.replacing or track["status"] not in ("Ready", "Error")):
-                continue
-            self.replacing.add(identity)
-            self.jobs.replace_recording(track, dict(self.settings))
-            queued += 1
-        self.status.setText(f"Поиск других записей в фоне: {queued}." if queued else
-                            "Выберите уже скачанную из сети песню для поиска другой записи.")
+        identities = list(dict.fromkeys(identities))
+        if len(identities) != 1:
+            self.status.setText("Выделите один трек для выбора другой записи.")
+            return
+        track = self.library.track(identities[0])
+        if not track or track["status"] not in ("Ready", "Error", "NotDownloaded") or track["id"] in self.replacing:
+            self.status.setText("Дождитесь завершения обработки этой записи.")
+            return
+        if self.recording_dialog:
+            if self.recording_dialog.track["id"] == track["id"]:
+                self.recording_dialog.show()
+                self.recording_dialog.raise_()
+                return
+            self.recording_dialog.close()
+        dialog = RecordingDialog(self, track)
+        self.recording_dialog = dialog
+        self.recording_dialogs.add(dialog)
+        dialog.recordingChosen.connect(self._apply_recording_choice)
+        dialog.finished.connect(lambda _result: self._recording_closed(dialog))
+        dialog.closedAndStopped.connect(self._cleanup_recording_dialog)
+        dialog.show()
+
+    def _recording_closed(self, dialog):
+        if self.recording_dialog is dialog:
+            self.recording_dialog = None
+
+    def _cleanup_recording_dialog(self, dialog):
+        if dialog in self.recording_dialogs:
+            self.recording_dialogs.remove(dialog)
+            dialog.deleteLater()
+
+    def _apply_recording_choice(self, identity, candidate):
+        track = self.library.track(identity)
+        if not track or identity in self.replacing or self.closing:
+            return
+        if track["status"] not in ("Ready", "Error", "NotDownloaded"):
+            self.status.setText("Дождитесь завершения анализа, затем выберите запись повторно.")
+            return
+        self.replacing.add(identity)
+        self.jobs.replace_recording(track, dict(self.settings), candidate)
+        self.status.setText("Подготавливаю выбранную запись…")
 
     def _replacement_progress(self, identity, percent, stage):
         if self.closing or identity not in self.replacing:
@@ -834,7 +1111,7 @@ class MusicPanel(QtWidgets.QWidget):
         track = self.library.track(identity)
         if track:
             self.status.setText(f"{track['title']}: {stage} · {percent}%")
-            for table in self.playlist_lists.values():
+            for table in self._track_tables():
                 table.update_track(track | {"status": "Replacing"})
 
     def _replacement_failed(self, identity, message):
@@ -843,7 +1120,7 @@ class MusicPanel(QtWidgets.QWidget):
             return
         track = self.library.track(identity)
         if track:
-            for table in self.playlist_lists.values():
+            for table in self._track_tables():
                 table.update_track(track)
         self.status.setText("Другая запись: " + message)
 
@@ -903,11 +1180,19 @@ class MusicPanel(QtWidgets.QWidget):
         if not playlist_id:
             self.create_playlist()
             playlist_id = self.selected_playlist
+        self._add_tracks_to_playlist(track_ids, playlist_id)
+
+    def _add_tracks_to_playlist(self, track_ids, playlist_id):
         playlist = next((item for item in self.library.playlists() if item["id"] == playlist_id), None)
         if playlist:
-            self.library.set_playlist_tracks(playlist_id, playlist["tracks"] + track_ids)
+            known = {track["id"] for track in self.library.tracks()}
+            tracks = list(dict.fromkeys(playlist["tracks"] + [identity for identity in track_ids if identity in known]))
+            added = [identity for identity in tracks if identity not in playlist["tracks"]]
+            if not added:
+                return
+            self.library.set_playlist_tracks(playlist_id, tracks)
             if playlist_id == self.active_playlist:
-                self.player.replace_queue(playlist["tracks"] + track_ids)
+                self.player.reorder_queue(list(dict.fromkeys(self.player.queue.ordered_tracks() + added)))
             self.refresh_playlists()
 
     def _playlist_order_changed(self, *args):
@@ -934,12 +1219,26 @@ class MusicPanel(QtWidgets.QWidget):
         selected = self.selected_track_ids()
         if not selected:
             return
-        tracks = [item["id"] for item in self.library.tracks()] if len(selected) == 1 else selected
+        tracks = [self.library_table.item(row, 0).data(QtCore.Qt.UserRole)
+                  for row in range(self.library_table.rowCount())
+                  if not self.library_table.isRowHidden(row)] if len(selected) == 1 else selected
         self.active_playlist = None
         self.player.set_queue(tracks, tracks.index(selected[0]))
         self.play()
 
     def play_playlist(self, mix=False):
+        if self.playlist_tabs.currentWidget() is self.now_table:
+            if mix:
+                if self.shuffle_check.isChecked():
+                    self._shuffle_changed(True)
+                else:
+                    self.shuffle_check.setChecked(True)
+                self.play()
+            elif self.now_table.currentRow() >= 0:
+                self._play_queue_row(self.now_table.currentRow())
+            else:
+                self.play()
+            return
         playlist = next((item for item in self.library.playlists() if item["id"] == self.selected_playlist), None)
         if playlist and playlist["tracks"]:
             self.active_playlist = playlist["id"]
@@ -968,7 +1267,7 @@ class MusicPanel(QtWidgets.QWidget):
         track = self.library.track(track_id)
         if not track:
             return
-        if track["status"] != "Ready":
+        if track["status"] != "Ready" or track.get("analysis_version") != ANALYSIS_VERSION:
             self.enqueue_analysis(track, priority=True)
             self.status.setText(f"{track['title']}: ожидание загрузки / анализа")
             return
@@ -1014,18 +1313,64 @@ class MusicPanel(QtWidgets.QWidget):
         else:
             self.cover.setText("♫")
         self._queue_changed(self.player.queue.ordered_tracks())
+        if self.lyrics_dialog and self.lyrics_dialog.isVisible():
+            self.lyrics_dialog.set_track(track)
 
     def _queue_changed(self, tracks):
+        self.lyrics_button.setEnabled(bool(self.player.current_track))
+        if not self.player.current_track and self.lyrics_dialog:
+            self.lyrics_dialog.close()
         self.playback_queue.clear()
         for track_id in tracks:
             track = self.library.track(track_id)
             self.playback_queue.addItem(f"{track['title']} · {track['status']}" if track else "Трек удалён")
         self.playback_queue.setCurrentRow(self.player.queue.cursor)
+        self._refresh_now()
+
+    def _track_tables(self):
+        return [*self.playlist_lists.values(), self.now_table]
+
+    def _refresh_now(self, refresh_metadata=False):
+        order = self.player.queue.ordered_tracks()
+        table = self.now_table
+        if self._now_order != order or refresh_metadata:
+            table.fill(order, {track["id"]: track for track in self.library.tracks()})
+            self._now_order = list(order)
+            for row in range(table.rowCount()):
+                item = table.item(row, 0)
+                item.setIcon(QtGui.QIcon())
+                font = item.font()
+                font.setBold(False)
+                item.setFont(font)
+            self._now_current = None
+        current = self.player.current_track
+        if current != self._now_current:
+            for identity in (self._now_current, current):
+                row = table.rows_by_id.get(identity)
+                if row is not None:
+                    item = table.item(row, 0)
+                    item.setIcon(icon("play") if identity == current else QtGui.QIcon())
+                    font = item.font()
+                    font.setBold(identity == current)
+                    item.setFont(font)
+            self._now_current = current
+        if self.playlist_tabs.indexOf(table) >= 0:
+            self.playlist_tabs.setTabToolTip(self.playlist_tabs.indexOf(table),
+                f"Текущая очередь: {len(order)} треков. Показан фактический порядок воспроизведения.")
+
+    def _now_order_changed(self):
+        self.player.reorder_queue(self.now_table.track_ids())
 
     def _jump_queue(self, item):
+        self._play_queue_row(self.playback_queue.row(item))
+
+    def _play_queue_row(self, row):
+        if not 0 <= row < len(self.player.queue.order):
+            return
+        self.player.clear_repeat()
         self.player.backend.stop()
         self.player.prepared = None
-        self.player.queue.cursor = self.playback_queue.row(item)
+        self.player.queue.cursor = row
         self.player.want_play = True
         self.sourceRequested.emit("player")
         self.player._request_current()
@@ -1042,6 +1387,7 @@ class MusicPanel(QtWidgets.QWidget):
         self._queue_changed(self.player.queue.ordered_tracks())
 
     def _position_changed(self, position):
+        self._update_lyrics_position(position)
         if not self.seek_slider.isSliderDown():
             self.seek_slider.setValue(round(position * 1000))
         self.time_label.setText(f"{duration_text(position)} / {duration_text(self.seek_slider.maximum() / 1000)}")
@@ -1051,7 +1397,8 @@ class MusicPanel(QtWidgets.QWidget):
 
     def _preview(self, bars, energy, colors):
         track = self.library.track(self.player.current_track) if self.player.current_track else None
-        bpm = f"{track.get('bpm', 0):.1f}" if track and track.get("bpm") else "—"
+        tempo = self.scheduler.analysis.tempo_at(self.player.position_seconds()) if self.scheduler.analysis else 0
+        bpm = f"{tempo:.1f}" if tempo else "—"
         confidence = f"{track.get('tempo_confidence', 0):.0%}" if track else "—"
         self.now_details.setText(f"BPM: {bpm} · уверенность: {confidence} · энергия: {energy:.0%} · {self.settings['preset']}")
         details = source_details(track) if track else ""
@@ -1070,17 +1417,43 @@ class MusicPanel(QtWidgets.QWidget):
         if not self.closing:
             track = self.library.record_listen(track_id)
             if track:
-                for table in self.playlist_lists.values():
+                for table in self._track_tables():
                     table.update_track(track)
 
     def _shuffle_changed(self, enabled):
+        self._update_shuffle_icon()
         self.player.queue.set_shuffle(enabled)
         self._queue_changed(self.player.queue.ordered_tracks())
         self.save_preferences()
 
+    def _update_shuffle_icon(self):
+        enabled = self.shuffle_check.isChecked()
+        self.shuffle_check.setIcon(icon("shuffle", muted=not enabled, active=enabled))
+        self.shuffle_check.setToolTip("Микс включён" if enabled else "Микс выключен")
+
+    def apply_theme(self):
+        for button, kind in ((self.previous_button, QtWidgets.QStyle.SP_MediaSkipBackward),
+                             (self.next_button, QtWidgets.QStyle.SP_MediaSkipForward),
+                             (self.stop_button, QtWidgets.QStyle.SP_MediaStop),
+                             (self.repeat_button, QtWidgets.QStyle.SP_BrowserReload)):
+            button.setIcon(self._transport_icon(kind))
+        self.play_pause_button.setIcon(self._transport_icon(QtWidgets.QStyle.SP_MediaPause
+                                      if self.player.want_play else QtWidgets.QStyle.SP_MediaPlay))
+        self._update_shuffle_icon()
+        self.add_music_button.setIcon(icon("folder-add"))
+        for name, button in self.playlist_buttons.items():
+            button.setIcon(icon(name))
+        index = self.playlist_tabs.indexOf(self.now_table)
+        self.playlist_tabs.setTabIcon(index, icon("music"))
+        self.playlist_tabs.tabBar().setTabTextColor(index, QtGui.QColor(colors()["accent"]))
+
     def _settings_changed(self, *args):
         if not self.building:
             self.settings_timer.start()
+
+    def _music_color_changed(self, _color):
+        self.music_color_mode.setCurrentIndex(self.music_color_mode.findData("custom"))
+        self._settings_changed()
 
     def apply_show_settings(self):
         if self.closing:
@@ -1088,6 +1461,7 @@ class MusicPanel(QtWidgets.QWidget):
         selected = [lamp for row, lamp in enumerate(self.lamp_ids)
                     if self.lamp_table.item(row, 0).checkState() == QtCore.Qt.Checked]
         settings = show_settings({"preset": self.preset_combo.currentText(), "intensity": self.intensity_spin.value(),
+            "color_mode": self.music_color_mode.currentData(), "palette": [list(button.color) for button in self.music_color_buttons],
             "max_brightness": self.brightness_spin.value() / 100, "update_hz": self.update_spin.value(),
             "latency_ms": self.latency_spin.value(), "lamp_ids": selected,
             "lamp_offsets": {lamp: spin.value() for lamp, spin in self.offset_spins.items()}}, self.lamp_ids)
@@ -1207,10 +1581,16 @@ class MusicPanel(QtWidgets.QWidget):
 
     def shutdown(self):
         if not self.closing:
+            for dialog in list(self.recording_dialogs):
+                dialog.close()
+            if self.lyrics_dialog:
+                self.lyrics_dialog.close()
+                self.lyrics_dialog.client.cancel()
             self.save_preferences()
             self.closing = True
             self.settings_timer.stop()
             self.player.stop()
             self.scheduler.shutdown()
             self.jobs.stop()
-        return not self.jobs.isRunning() and (not self.measure_future or self.measure_future.done())
+        return (not self.jobs.isRunning() and (not self.measure_future or self.measure_future.done())
+                and not self.recording_dialogs)

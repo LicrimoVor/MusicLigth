@@ -1,6 +1,7 @@
 from collections import deque
 import math
 import time
+import re
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -8,6 +9,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from libs.lerp_color import lerp
 from model.audio import SPECTRUM_BINS
 from model.color import clamp, color_to_hex
+from ui.theme import colors, current_theme
+from ui.icons import ASSETS
 
 
 class ColorButton(QtWidgets.QPushButton):
@@ -73,7 +76,7 @@ class SpectrumWidget(QtWidgets.QWidget):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         rect = self.rect()
-        painter.fillRect(rect, QtGui.QColor("#0d1115"))
+        painter.fillRect(rect, QtGui.QColor(colors()["plot"]))
 
         baseline = rect.bottom() - 26
         top = rect.top() + 32
@@ -85,7 +88,7 @@ class SpectrumWidget(QtWidgets.QWidget):
         bar_width = max(0.1, slot_width - gap)
 
         accent = QtGui.QColor(*self.current_color)
-        dim = QtGui.QColor("#26313a")
+        dim = QtGui.QColor(colors()["grid"])
 
         for index, value in enumerate(self.bars):
             value = clamp(float(value))
@@ -101,12 +104,12 @@ class SpectrumWidget(QtWidgets.QWidget):
             painter.setPen(QtCore.Qt.NoPen)
             painter.drawRoundedRect(bar_rect, 3, 3)
 
-        painter.setPen(QtGui.QPen(QtGui.QColor("#34404a"), 1))
+        painter.setPen(QtGui.QPen(QtGui.QColor(colors()["grid"]), 1))
         painter.drawLine(rect.left() + 8, baseline, rect.right() - 8, baseline)
 
-        painter.setPen(QtGui.QColor("#c8d2dc"))
+        painter.setPen(QtGui.QColor(colors()["text"]))
         painter.drawText(rect.adjusted(12, 8, -12, -8), QtCore.Qt.AlignTop, "Спектр аудио")
-        painter.setPen(QtGui.QColor("#9aa6b2"))
+        painter.setPen(QtGui.QColor(colors()["muted"]))
         labels = QtCore.QRectF(12, baseline + 5, available, 18)
         for text, alignment in (("35 Гц", QtCore.Qt.AlignLeft), ("750 Гц", QtCore.Qt.AlignHCenter),
                                 ("16 кГц", QtCore.Qt.AlignRight)):
@@ -184,19 +187,19 @@ class BeatGraphWidget(QtWidgets.QWidget):
 
     def background_pixmap(self):
         ratio = self.devicePixelRatioF()
-        key = (self.width(), self.height(), ratio)
+        key = (self.width(), self.height(), ratio, current_theme())
         if self._background is not None and self._background_key == key:
             return self._background
 
         pixmap = QtGui.QPixmap(int(self.width() * ratio), int(self.height() * ratio))
         pixmap.setDevicePixelRatio(ratio)
-        pixmap.fill(QtGui.QColor("#0d1115"))
+        pixmap.fill(QtGui.QColor(colors()["plot"]))
         painter = QtGui.QPainter(pixmap)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         rect = self.rect()
         plot = self.plot_rect()
 
-        painter.setPen(QtGui.QPen(QtGui.QColor("#26313a"), 1))
+        painter.setPen(QtGui.QPen(QtGui.QColor(colors()["grid"]), 1))
         painter.drawRoundedRect(plot, 6, 6)
 
         font = painter.font()
@@ -205,28 +208,28 @@ class BeatGraphWidget(QtWidgets.QWidget):
 
         for percent in range(0, 101, 25):
             y = plot.bottom() - plot.height() * percent / 100
-            painter.setPen(QtGui.QPen(QtGui.QColor("#202a32"), 1))
+            painter.setPen(QtGui.QPen(QtGui.QColor(colors()["grid"]), 1))
             painter.drawLine(QtCore.QPointF(plot.left(), y), QtCore.QPointF(plot.right(), y))
-            painter.setPen(QtGui.QColor("#9aa6b2"))
+            painter.setPen(QtGui.QColor(colors()["muted"]))
             label = QtCore.QRectF(0, y - 9, 40, 18)
             painter.drawText(label, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, f"{percent}%")
 
         for index in range(5):
             x = plot.left() + plot.width() * index / 4
-            painter.setPen(QtGui.QPen(QtGui.QColor("#202a32"), 1))
+            painter.setPen(QtGui.QPen(QtGui.QColor(colors()["grid"]), 1))
             painter.drawLine(QtCore.QPointF(x, plot.top()), QtCore.QPointF(x, plot.bottom()))
             label = "сейчас" if index == 4 else f"−{self.duration_seconds * (1 - index / 4):g} с"
-            painter.setPen(QtGui.QColor("#9aa6b2"))
+            painter.setPen(QtGui.QColor(colors()["muted"]))
             painter.drawText(QtCore.QRectF(x - 24, plot.bottom() + 8, 48, 18), QtCore.Qt.AlignCenter, label)
 
-        painter.setPen(QtGui.QColor("#c8d2dc"))
+        painter.setPen(QtGui.QColor(colors()["text"]))
         painter.drawText(rect.adjusted(12, 8, -12, -8), QtCore.Qt.AlignTop,
                          f"Бит · последние {self.duration_seconds:g} секунд")
-        painter.setPen(QtGui.QColor("#40c0ff"))
+        painter.setPen(QtGui.QColor(colors()["detector"]))
         painter.drawText(48, 36, "Детектор")
-        painter.setPen(QtGui.QColor("#62e5ab"))
+        painter.setPen(QtGui.QColor(colors()["accent"]))
         painter.drawText(132, 36, "Отклик")
-        painter.setPen(QtGui.QColor("#ffcf66"))
+        painter.setPen(QtGui.QColor(colors()["beat"]))
         painter.drawText(202, 36, "Удар")
         painter.end()
 
@@ -286,9 +289,9 @@ class BeatGraphWidget(QtWidgets.QWidget):
                     painter.setBrush(QtGui.QColor(98, 229, 171, 22))
                     painter.drawPolygon(fill)
                 painter.setBrush(QtCore.Qt.NoBrush)
-                painter.setPen(QtGui.QPen(QtGui.QColor("#40c0ff"), 1))
+                painter.setPen(QtGui.QPen(QtGui.QColor(colors()["detector"]), 1))
                 painter.drawPolyline(raw)
-                painter.setPen(QtGui.QPen(QtGui.QColor("#62e5ab"), 1))
+                painter.setPen(QtGui.QPen(QtGui.QColor(colors()["accent"]), 1))
                 painter.drawPolyline(response)
             painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
             for timestamp, level, raw_level, onset in samples:
@@ -296,29 +299,29 @@ class BeatGraphWidget(QtWidgets.QWidget):
                     x = plot.left() + (timestamp - start) / self.duration_seconds * plot.width()
                     painter.setPen(QtGui.QPen(QtGui.QColor(255, 207, 102, 110), 1, QtCore.Qt.DotLine))
                     painter.drawLine(QtCore.QPointF(x, plot.top()), QtCore.QPointF(x, plot.bottom()))
-                    painter.setBrush(QtGui.QColor("#ffcf66"))
+                    painter.setBrush(QtGui.QColor(colors()["beat"]))
                     painter.setPen(QtCore.Qt.NoPen)
                     painter.drawEllipse(QtCore.QPointF(x, plot.bottom() - raw_level * plot.height()), 3, 3)
-            painter.setBrush(QtGui.QColor("#62e5ab"))
+            painter.setBrush(QtGui.QColor(colors()["accent"]))
             painter.setPen(QtCore.Qt.NoPen)
             painter.drawEllipse(QtCore.QPointF(plot.right(), plot.bottom() - samples[-1][1] * plot.height()), 3, 3)
             painter.restore()
 
             current_percent = int(samples[-1][1] * 100)
-            painter.setPen(QtGui.QColor("#edf2f7"))
+            painter.setPen(QtGui.QColor(colors()["text"]))
             painter.drawText(
                 QtCore.QRectF(self.rect()).adjusted(0, 6, -20, -self.height() + 30),
                 QtCore.Qt.AlignRight | QtCore.Qt.AlignTop,
                 f"{current_percent}%",
             )
         else:
-            painter.setPen(QtGui.QColor("#6f7c87"))
+            painter.setPen(QtGui.QColor(colors()["muted"]))
             painter.drawText(plot, QtCore.Qt.AlignCenter, "Нет данных")
         painter.end()
 
 
-def app_stylesheet():
-    return """
+def app_stylesheet(theme="dark"):
+    stylesheet = """
     QWidget {
         background: #151a1f;
         color: #edf2f7;
@@ -335,16 +338,16 @@ def app_stylesheet():
         border: 1px solid #303941;
         border-radius: 8px;
     }
-    QFrame#playerHeader QToolButton {
+    QToolButton {
         background: #26313a;
         border: 1px solid #3a4650;
         border-radius: 5px;
         padding: 4px;
     }
-    QFrame#playerHeader QToolButton:hover {
+    QToolButton:hover {
         background: #31404b;
     }
-    QFrame#playerHeader QToolButton:checked {
+    QToolButton:checked {
         background: #234b3c;
         border-color: #62e5ab;
     }
@@ -374,7 +377,7 @@ def app_stylesheet():
         color: #69747e;
         background: #20262c;
     }
-    QComboBox, QSpinBox, QLineEdit {
+    QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
         background: #0f1419;
         border: 1px solid #35414b;
         border-radius: 5px;
@@ -397,6 +400,19 @@ def app_stylesheet():
         border: 1px solid #303941;
         border-radius: 8px;
     }
+    QTabBar, QTabWidget, QTabWidget::tab-bar {
+        background: #151a1f;
+    }
+    QTabBar::tab {
+        border: 0;
+    }
+    QTabBar::tear, QTabBar::scroller {
+        background: #151a1f;
+    }
+    QTableCornerButton::section {
+        background: #20262c;
+        border: 0;
+    }
     QTabBar::tab {
         background: #20262c;
         padding: 9px 16px;
@@ -407,10 +423,24 @@ def app_stylesheet():
     QTabBar::tab:selected {
         background: #34404a;
     }
-    QTableWidget, QScrollArea {
+    QTableWidget, QScrollArea, QTextBrowser, QTextEdit {
         background: #0f1419;
         border: 1px solid #303941;
         border-radius: 6px;
+    }
+    QMenu {
+        background: #20262c;
+        border: 1px solid #3a4650;
+        padding: 5px;
+    }
+    QMenu::item {
+        padding: 7px 24px 7px 12px;
+    }
+    QMenu::item:selected {
+        background: #34404a;
+    }
+    QMenu::item:disabled, QToolButton:disabled {
+        color: #69747e;
     }
     QHeaderView::section {
         background: #20262c;
@@ -421,4 +451,64 @@ def app_stylesheet():
     QCheckBox {
         padding: 4px;
     }
+    QComboBox::drop-down { border: 0; width: 24px; }
+    QSpinBox::up-button, QSpinBox::down-button,
+    QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+        width: 18px; border: 0; background: #26313a;
+    }
+    QSlider::groove:horizontal { height: 4px; background: #35414b; border-radius: 2px; }
+    QSlider::sub-page:horizontal { background: #62e5ab; border-radius: 2px; }
+    QSlider::handle:horizontal {
+        width: 12px; margin: -5px 0; background: #62e5ab;
+        border: 1px solid #3a4650; border-radius: 5px;
+    }
+    QScrollBar {
+        background: #0f1419;
+        border: 0;
+        margin: 2px;
+        border-radius: 4px;
+    }
+    QScrollBar:vertical { width: 12px; }
+    QScrollBar:horizontal { height: 12px; }
+    QScrollBar::handle {
+        background: #526170;
+        border: 0;
+        border-radius: 4px;
+    }
+    QScrollBar::handle:vertical { min-height: 32px; }
+    QScrollBar::handle:horizontal { min-width: 32px; }
+    QScrollBar::handle:hover { background: #718396; }
+    QScrollBar::handle:pressed { background: #62e5ab; }
+    QScrollBar::handle:disabled { background: #303941; }
+    QScrollBar::add-line, QScrollBar::sub-line {
+        width: 0;
+        height: 0;
+        border: 0;
+        background: transparent;
+    }
+    QScrollBar::up-arrow, QScrollBar::down-arrow,
+    QScrollBar::left-arrow, QScrollBar::right-arrow {
+        width: 0;
+        height: 0;
+        image: none;
+    }
+    QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+    QAbstractScrollArea::corner { background: #0f1419; border: 0; }
     """
+    if theme == "light":
+        replacements = {"#151a1f": "#f1f4f8", "#edf2f7": "#172331", "#9aa6b2": "#536579",
+            "#303941": "#c5cfd9", "#26313a": "#e2e9f0", "#3a4650": "#b6c3cf",
+            "#31404b": "#d1deeb", "#234b3c": "#c7ebde", "#62e5ab": "#087f5b",
+            "#c8d2dc": "#364d63", "#69747e": "#7c8995", "#20262c": "#e8edf2",
+            "#0f1419": "#ffffff", "#35414b": "#b8c4d0", "#34404a": "#d3e3f2", "#d7dee6": "#263e52",
+            "#526170": "#93a4b5", "#718396": "#71869b"}
+        stylesheet = re.sub(r"#[0-9a-fA-F]{6}", lambda match: replacements.get(match[0], match[0]), stylesheet)
+    variant = "light" if theme == "light" else "dark"
+    up = (ASSETS / f"arrow-up-{variant}.svg").as_posix()
+    down = (ASSETS / f"arrow-down-{variant}.svg").as_posix()
+    stylesheet += f"""
+    QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{ image: url("{up}"); width: 9px; height: 6px; }}
+    QSpinBox::down-arrow, QDoubleSpinBox::down-arrow,
+    QComboBox::down-arrow {{ image: url("{down}"); width: 9px; height: 6px; }}
+    """
+    return stylesheet

@@ -111,6 +111,11 @@ class PlaylistImportTests(unittest.TestCase):
 
 
 class DownloadTests(unittest.TestCase):
+    def setUp(self):
+        catalogs = patch("music.providers.CatalogProviders.search", return_value=[])
+        catalogs.start()
+        self.addCleanup(catalogs.stop)
+
     def test_search_chooses_artist_title_duration_and_rejects_wrong_versions(self):
         entries = [{"title": "Artist - Song remix", "duration": 190, "url": "https://example.test/remix"},
                    {"title": "Other - Song", "duration": 190},
@@ -176,10 +181,10 @@ class ImportedPlaylistIntegrationTests(unittest.TestCase):
         shared.write_beats(audio, duration=3)
         with patch.object(self.panel.jobs.downloader, "fetch", return_value={"path": str(audio), "resolved_url": "https://example.test/audio"}) as fetch:
             self.panel.jobs.import_playlists([self.root])
-            self.assertTrue(shared.wait_until(lambda: self.panel.playlist_tabs.count() == 2, 5))
+            self.assertTrue(shared.wait_until(lambda: self.panel.playlist_tabs.count() == 3, 5))
             self.assertEqual(fetch.call_count, 0)
             self.assertTrue(all(track["status"] == "NotDownloaded" for track in self.panel.library.tracks()))
-            self.panel.playlist_tabs.setCurrentIndex(0)
+            self.panel.playlist_tabs.setCurrentIndex(1)
             self.panel.playlist_tracks.selectRow(0)
             self.panel.play_playlist()
             self.assertTrue(shared.wait_until(lambda: self.panel.player.state == "playing", 15), self.panel.status.text())
@@ -203,7 +208,7 @@ class ImportedPlaylistIntegrationTests(unittest.TestCase):
             self.panel.library.add_search_track(first["id"], title, "Artist")
         other = self.panel.library.add_search_track(second["id"], "Other", "Artist")
         self.panel.refresh_playlists()
-        self.panel.playlist_tabs.setCurrentIndex(0)
+        self.panel.playlist_tabs.setCurrentWidget(self.panel.playlist_lists[first["id"]])
         with patch.object(self.panel.jobs, "analyse"), patch("ui.MusicPanel.random.randrange", return_value=2):
             self.panel.play_playlist(mix=True)
             tracks = self.panel.player.queue.ordered_tracks()

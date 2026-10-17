@@ -15,7 +15,7 @@ from music.metadata import read_metadata
 from music.storage import atomic_json, check_cancel, content_id
 
 
-ANALYSIS_VERSION = 3
+ANALYSIS_VERSION = 4
 FEATURE_NAMES = ("time", "rms", "bass", "mid", "treble", "flux", "loudness",
                  "intensity", "trend", "spectral_change")
 SPECTRUM_START = len(FEATURE_NAMES)
@@ -55,7 +55,7 @@ def estimate_tempo(novelty, frame_rate):
     if correlation[0] < 1e-9:
         return 0.0, 0.0
     correlation /= correlation[0]
-    lo, hi = max(1, int(frame_rate * 60 / 200)), min(len(correlation), int(frame_rate * 60 / 60) + 1)
+    lo, hi = max(1, int(frame_rate * 60 / 240)), min(len(correlation), int(frame_rate * 60 / 50) + 1)
     peaks, _ = signal.find_peaks(correlation[lo:hi])
     if not len(peaks):
         return 0.0, 0.0
@@ -74,6 +74,62 @@ def estimate_tempo(novelty, frame_rate):
     return float(60 * frame_rate / lag), float(np.clip(correlation[index], 0, 1))
 
 
+def track_dynamic_beats(novelty, samplerate, hop, cancel=None):
+    """Local autocorrelation tempo + DP with a tempo per frame, never a fixed song BPM.
+
+    See librosa's plot_dynamic_beat example. Work on bounded overlapping chunks
+    so a long recording does not allocate a full-song tempogram in memory.
+    """
+    import librosa
+    rate = samplerate / hop
+    count = len(novelty)
+    tempo = np.zeros(count, dtype=np.float32)
+    if count < rate * 2 or np.count_nonzero(novelty > 0.1) < 3:
+        return tempo, np.zeros(0, dtype=int), 0.0
+    context, step = round(4 * rate), max(1, round(30 * rate))
+    for start in range(0, count, step):
+        check_cancel(cancel)
+        end = min(count, start + step)
+        left, right = max(0, start - context), min(count, end + context)
+        local = librosa.feature.tempo(onset_envelope=novelty[left:right], sr=samplerate,
+            hop_length=hop, aggregate=None, ac_size=min(4.0, (right - left) / rate),
+            max_tempo=240, std_bpm=1.0)
+        tempo[start:end] = local[start - left:end - left]
+    tempo = ndimage.median_filter(tempo, size=max(1, round(rate * 0.25)) | 1)
+    # Confidence is local too: a strong section must not impose its rhythm on a
+    # quiet intro, a free-time interlude, or another section with a different BPM.
+    centers = np.arange(0, count + 1, max(1, round(rate * 0.5)))
+    confidence = []
+    for center in centers:
+        check_cancel(cancel)
+        values = novelty[max(0, center - round(2 * rate)):min(count, center + round(2 * rate))]
+        confidence.append(estimate_tempo(values, rate)[1])
+    confidence = np.interp(np.arange(count), centers, confidence)
+    check_cancel(cancel)
+    # trim=True can discard the faster ending of an accelerando. Instead keep
+    # the DP sequence and trim individual beats against actual nearby attacks.
+    _, frames = librosa.beat.beat_track(onset_envelope=novelty, sr=samplerate,
+                                      hop_length=hop, bpm=tempo, tightness=60, trim=False)
+    radius = max(1, round(rate * 0.07))
+    peaks, _ = signal.find_peaks(novelty, height=0.08)
+    beats = []
+    for frame in frames:
+        check_cancel(cancel)
+        candidates = peaks[np.searchsorted(peaks, frame - radius):np.searchsorted(peaks, frame + radius + 1)]
+        if not len(candidates) or confidence[frame] < 0.18:
+            continue
+        snapped = int(candidates[np.argmax(novelty[candidates])])
+        if not beats or snapped - beats[-1] > rate * 0.18:
+            beats.append(snapped)
+    active = ndimage.maximum_filter1d(novelty, size=max(1, round(rate * 2)) | 1) > 0.08
+    tempo[~active | (confidence < 0.18)] = 0
+    frames = np.asarray(beats, dtype=int)
+    certainty = float(np.median(confidence[frames])) if len(frames) else 0.0
+    if not len(frames):
+        tempo[:] = 0
+    return tempo, frames, certainty
+
+
 class AnalysisData:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -85,6 +141,10 @@ class AnalysisData:
             raise ValueError("Повреждённый кэш признаков")
         self.beats = np.load(self.directory / "beats.npy", mmap_mode="r", allow_pickle=False)
         self.onsets = np.load(self.directory / "onsets.npy", mmap_mode="r", allow_pickle=False)
+        self.tempo = np.load(self.directory / "tempo.npy", mmap_mode="r", allow_pickle=False)
+        if self.tempo.shape != (len(self.features),):
+            self.close()
+            raise ValueError("Повреждённая карта темпа")
 
     @property
     def duration(self):
@@ -96,8 +156,14 @@ class AnalysisData:
         index = math.floor((seconds - offset) / step + 1e-7)
         return np.asarray(self.features[max(0, min(index, len(self.features) - 1))])
 
+    def tempo_at(self, seconds):
+        step = self.metadata["hop"] / self.metadata["samplerate"]
+        offset = self.metadata["window_size"] / (2 * self.metadata["samplerate"])
+        index = int(np.clip(round((seconds - offset) / step), 0, len(self.tempo) - 1))
+        return float(self.tempo[index])
+
     def close(self):
-        for value in (self.features, self.beats, self.onsets):
+        for value in (self.features, self.beats, self.onsets, self.tempo):
             mapping = getattr(value, "_mmap", None)
             if mapping is not None:
                 mapping.close()
@@ -230,12 +296,9 @@ class MusicAnalyser:
                 import librosa
                 onsets = librosa.onset.onset_detect(onset_envelope=novelty, sr=samplerate,
                                                     hop_length=hop, units="frames", normalize=False)
-                bpm, confidence = estimate_tempo(novelty, frame_rate)
-                if confidence >= 0.18 and len(onsets) >= 3:
-                    _, beat_frames = librosa.beat.beat_track(onset_envelope=novelty, sr=samplerate,
-                                                           hop_length=hop, bpm=bpm, trim=True)
-                else:
-                    bpm, confidence, beat_frames = 0.0, 0.0, np.zeros(0, dtype=int)
+                tempo, beat_frames, confidence = track_dynamic_beats(novelty, samplerate, hop, cancel)
+                valid_tempos = tempo[tempo > 0]
+                bpm = float(np.median(valid_tempos)) if len(valid_tempos) else 0.0
                 check_cancel(cancel)
                 offset = window_size / (2 * samplerate)
                 beats = np.asarray(beat_frames, dtype=float) * hop / samplerate + offset
@@ -244,6 +307,7 @@ class MusicAnalyser:
                 beats, onset_times = beats[beats < duration], onset_times[onset_times < duration]
                 np.save(work / "beats.npy", beats.astype("float64"), allow_pickle=False)
                 np.save(work / "onsets.npy", onset_times.astype("float64"), allow_pickle=False)
+                np.save(work / "tempo.npy", tempo, allow_pickle=False)
                 progress(93, "Структура композиции")
                 sections, transitions = self._structure(slow, frame_rate, duration)
                 beat_indices = np.minimum(np.asarray(beat_frames, dtype=int), count - 1)
@@ -255,6 +319,8 @@ class MusicAnalyser:
                             "duration": duration, "samplerate": samplerate, "channels": source.channels,
                             "hop": hop, "window_size": window_size, "frame_count": count,
                             "bpm": bpm, "tempo_confidence": confidence, "strong_beats": strong,
+                            "tempo_min": float(np.percentile(valid_tempos, 5)) if len(valid_tempos) else 0.0,
+                            "tempo_max": float(np.percentile(valid_tempos, 95)) if len(valid_tempos) else 0.0,
                             "bars": [], "sections": sections, "transitions": transitions,
                             "energy_peaks": features[signal.find_peaks(intensity, height=0.7,
                                 distance=max(1, int(frame_rate)))[0], 0].tolist(),

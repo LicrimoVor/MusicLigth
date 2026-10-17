@@ -488,10 +488,10 @@ class MusicIntegrationTests(unittest.TestCase):
         self.panel = self.window.music_panel
 
     def tearDown(self):
-        self.window.close()
+        self.window.request_exit()
         self.panel.jobs.wait(10000)
         wait_until(lambda: not self.window.pending_lamp_updates and not self.window.queued_colors, 3)
-        self.window.close()
+        self.window.request_exit()
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(2)
         self.loop.close()
@@ -719,7 +719,7 @@ class MusicIntegrationTests(unittest.TestCase):
         self.window.select_light_source("player")
         self.window.send_colors({"a": (100, 100, 0)}, 1, source="player")
         self.assertTrue(wait_until(lambda: any(call[0].get("a") == (100, 100, 0) for call in self.controller.calls)))
-        self.window.close()
+        self.window.request_exit()
         self.assertTrue(wait_until(lambda: not self.window.pending_lamp_updates and not self.window.queued_colors, 5))
         latest = {}
         for call in self.controller.calls:

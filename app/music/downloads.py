@@ -16,14 +16,17 @@ import soundfile as sf
 from music.matching import (audio_format, choose_result, expected_duration, match_score,
                             rank_results, recording_url, search_query, source_name)
 from music.playlist_import import normalized
+from music.providers import CatalogProviders, download_audio, safe_choice
 from music.storage import CancelledAnalysis, atomic_json, check_cancel
 
 
 class MusicDownloader:
-    SOURCES = (("YouTube", "ytsearch8:"), ("SoundCloud", "scsearch8:"))
+    SOURCES = (("YouTube", "ytsearch8:"), ("SoundCloud", "scsearch8:"),
+               ("Яндекс Музыка", "yandex:"), ("VK Музыка", "vk:"))
 
-    def __init__(self, root):
+    def __init__(self, root, credentials=None):
         self.root = Path(root) / "downloads"
+        self.catalogs = CatalogProviders(credentials)
 
     def _run(self, args, directory, cancel, timeout=180):
         check_cancel(cancel)
@@ -64,6 +67,8 @@ class MusicDownloader:
                 "--socket-timeout", "12", "--retries", "1", "--extractor-retries", "1", "--no-playlist"]
 
     def _search_source(self, provider, prefix, query, cancel):
+        if prefix in ("yandex:", "vk:"):
+            return self.catalogs.search(prefix[:-1], query, cancel)
         with tempfile.TemporaryDirectory(prefix=".search-", dir=self.root) as temporary:
             data = json.loads(self._run(self._command() + ["--dump-single-json", "--flat-playlist",
                 "--skip-download", prefix + query], temporary, cancel, timeout=40))
@@ -71,34 +76,57 @@ class MusicDownloader:
                 raise ValueError("Источник вернул неверный список результатов")
             return [entry | {"provider": provider} for entry in data.get("entries") or [] if isinstance(entry, dict)]
 
-    def search(self, track, cancel=None, progress=lambda value, stage: None):
+    def _search_all(self, track, cancel, progress, query=None):
         self.root.mkdir(parents=True, exist_ok=True)
-        query = search_query(track)
+        query = query or search_query(track)
         entries, errors = [], []
-        progress(0, "Поиск: YouTube и SoundCloud")
+        progress(0, "Поиск: " + ", ".join(name for name, _prefix in self.SOURCES))
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = {pool.submit(self._search_source, name, prefix, query, cancel): name for name, prefix in self.SOURCES}
             for future in as_completed(futures):
                 check_cancel(cancel)
                 try:
                     entries.extend(future.result())
+                    progress(0, f"{futures[future]}: поиск завершён")
                 except CancelledAnalysis:
                     raise
-                except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+                except (OSError, ValueError, RuntimeError, TimeoutError, KeyError, TypeError, AttributeError) as exc:
                     errors.append(f"{futures[future]}: {exc}")
+                    progress(0, errors[-1])
+        return entries, errors
+
+    def search(self, track, cancel=None, progress=lambda value, stage: None):
+        entries, errors = self._search_all(track, cancel, progress)
         ranked = rank_results(entries, track)
         if not ranked:
             detail = ("\n" + "\n".join(errors)) if errors else ""
-            raise ValueError("Не найдена подходящая запись на YouTube и SoundCloud. Уточните исполнителя и название." + detail)
+            raise ValueError("Не найдена подходящая запись. Уточните исполнителя и название." + detail)
         return ranked
 
+    def browse(self, track, query=None, cancel=None, progress=lambda value, stage: None):
+        entries, errors = self._search_all(track, cancel, progress, query)
+        excluded = {recording_url({"url": value}) for value in track.get("excluded_urls", [])}
+        found = {}
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("title"):
+                continue
+            url = recording_url(entry)
+            if not url.startswith("https://") or url in excluded:
+                continue
+            score = match_score(entry, track)
+            found.setdefault(url, entry | {"webpage_url": url, "match_score": score})
+        return sorted(found.values(), key=lambda item: (-(item["match_score"] or 0), item["webpage_url"])), errors
+
     def _inspect(self, candidate, track, cancel, direct=False):
-        with tempfile.TemporaryDirectory(prefix=".inspect-", dir=self.root) as temporary:
-            info = json.loads(self._run(self._command() + ["--dump-single-json", "--skip-download",
-                candidate["webpage_url"]], temporary, cancel, timeout=50))
+        if candidate.get("provider_key") in ("yandex", "vk"):
+            info = self.catalogs.inspect(candidate, cancel)
+        else:
+            with tempfile.TemporaryDirectory(prefix=".inspect-", dir=self.root) as temporary:
+                info = json.loads(self._run(self._command() + ["--dump-single-json", "--skip-download",
+                    candidate["webpage_url"]], temporary, cancel, timeout=50))
         if not isinstance(info, dict):
             raise ValueError("Источник вернул неверные метаданные")
-        score = candidate.get("match_score", 1.0) if direct else match_score(info, track)
+        score = (candidate.get("match_score") or 1.0) if direct else match_score(info, track)
         if score is None or info.get("is_live"):
             raise ValueError("Уточнённые метаданные не совпадают с искомой песней")
         selected = audio_format(info)
@@ -135,7 +163,7 @@ class MusicDownloader:
                     inspected.append(future.result())
                 except CancelledAnalysis:
                     raise
-                except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+                except (OSError, ValueError, RuntimeError, TimeoutError, KeyError, TypeError, AttributeError) as exc:
                     errors.append(str(exc))
         if not inspected:
             raise ValueError("Не найдено полноценное аудио подходящего качества.\n" + "\n".join(errors[:3]))
@@ -173,8 +201,11 @@ class MusicDownloader:
             selected = candidate["selected_audio"]
             quality = selected["acodec"] + (f" · {selected['abr']:.0f} кбит/с" if selected["abr"] else "")
             progress(8, f"Загрузка: {candidate['provider']} · {quality}")
-            self._run(self._command() + ["--format", str(selected["format_id"]), "--max-filesize", "100M",
-                "--output", "source.%(ext)s", candidate["webpage_url"]], temporary, cancel, timeout=240)
+            if candidate.get("direct_audio"):
+                download_audio(selected["url"], Path(temporary) / "source.mp3", cancel)
+            else:
+                self._run(self._command() + ["--format", str(selected["format_id"]), "--max-filesize", "100M",
+                    "--output", "source.%(ext)s", candidate["webpage_url"]], temporary, cancel, timeout=240)
             files = [path for path in Path(temporary).glob("source.*") if path.suffix not in (".part", ".ytdl", ".json")]
             if len(files) != 1:
                 raise ValueError("Сервис не предоставил аудиофайл")
@@ -189,11 +220,14 @@ class MusicDownloader:
             # The caller moves the validated file atomically before this context exits.
             yield converted, duration
 
-    def fetch(self, track, cancel=None, progress=lambda value, stage: None):
+    def fetch(self, track, cancel=None, progress=lambda value, stage: None, *, candidate=None):
+        choice = candidate or track.get("recording_choice")
+        if choice:
+            track = track | {"expected_duration": choice.get("duration") or 0, "duration": 0, "search_by_name": True}
         query = search_query(track)
-        direct = track.get("download_url") if not track.get("search_by_name") else None
+        direct = choice["webpage_url"] if choice else track.get("download_url") if not track.get("search_by_name") else None
         identity = direct or normalized(query)
-        if track.get("download_revision"):
+        if track.get("download_revision") and not choice:
             identity += ":revision:" + str(track["download_revision"])
         directory = self.root / hashlib.sha256(identity.encode("utf-8")).hexdigest()
         audio, manifest = directory / "audio.wav", directory / "source.json"
@@ -209,7 +243,7 @@ class MusicDownloader:
             except (OSError, ValueError, RuntimeError):
                 pass
         self.root.mkdir(parents=True, exist_ok=True)
-        candidates = self._candidates(track, cancel, progress)
+        candidates = [self._inspect(choice, track, cancel, direct=True)] if choice else self._candidates(track, cancel, progress)
         errors = []
         for candidate in candidates[:4]:
             check_cancel(cancel)
@@ -220,6 +254,8 @@ class MusicDownloader:
                         "resolved_title": candidate.get("title", ""), "resolved_source": candidate["provider"],
                         "source_codec": selected["acodec"], "source_bitrate_kbps": selected["abr"],
                         "source_sample_rate": selected.get("asr") or 0, "source_duration": duration, "search_query": query}
+                    if choice or candidate.get("provider_key"):
+                        metadata["recording_choice"] = safe_choice(choice or candidate)
                     directory.mkdir(parents=True, exist_ok=True)
                     os.replace(converted, audio)
                     atomic_json(manifest, metadata)
