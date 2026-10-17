@@ -126,20 +126,23 @@ class DownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             downloader = MusicDownloader(temporary)
             original_run = downloader._run
-            result = {"title": "Artist - Song", "duration": 190, "url": "https://www.youtube.com/watch?v=test"}
+            result = {"title": "Artist - Song", "duration": 2, "url": "https://www.youtube.com/watch?v=test"}
+            details = result | {"formats": [{"format_id": "good", "vcodec": "none", "acodec": "opus", "abr": 160, "asr": 48000}]}
 
             def run(args, directory, cancel, timeout=180):
-                if any(value.startswith("ytsearch5:") for value in args):
-                    return json.dumps({"entries": [result]})
+                if any(value.startswith(("ytsearch8:", "scsearch8:")) for value in args):
+                    return json.dumps({"entries": [result] if any(value.startswith("ytsearch8:") for value in args) else []})
+                if "--dump-single-json" in args:
+                    return json.dumps(details)
                 if "yt_dlp" in args:
                     shared.write_beats(Path(directory) / "source.wav", duration=2)
                     return ""
                 return original_run(args, directory, cancel, timeout)
 
-            track = {"title": "Song", "artist": "Artist", "duration": 190}
+            track = {"title": "Song", "artist": "Artist", "duration": 2}
             with patch.object(downloader, "_run", side_effect=run) as process:
                 downloaded = downloader.fetch(track, threading.Event())
-                self.assertEqual(process.call_count, 3)
+                self.assertEqual(process.call_count, 5)
             audio = sf.info(downloaded["path"])
             self.assertEqual((audio.samplerate, audio.channels), (48000, 2))
             with patch.object(downloader, "_run", side_effect=AssertionError("cache must not use network")):

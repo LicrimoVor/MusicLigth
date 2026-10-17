@@ -28,6 +28,9 @@ class MusicJobs(QtCore.QThread):
     downloaded = QtCore.pyqtSignal(str, dict)
     textImported = QtCore.pyqtSignal(str, dict)
     importProgress = QtCore.pyqtSignal(str)
+    replacementReady = QtCore.pyqtSignal(str, dict)
+    replacementFailed = QtCore.pyqtSignal(str, str)
+    replacementProgress = QtCore.pyqtSignal(str, int, str)
     queueChanged = QtCore.pyqtSignal(int)
 
     def __init__(self, root, parent=None, *, playlist_root=None):
@@ -64,6 +67,14 @@ class MusicJobs(QtCore.QThread):
 
     def analyse(self, track, settings, priority=False):
         self._enqueue("analysis", track["id"], (dict(track), settings), priority=priority)
+
+    def replace_recording(self, track, settings):
+        excluded = list(track.get("excluded_urls") or [])
+        if track.get("resolved_url") and track["resolved_url"] not in excluded:
+            excluded.append(track["resolved_url"])
+        revision = int(track.get("download_revision") or 0) + 1
+        replacement = dict(track) | {"search_by_name": True, "download_revision": revision, "excluded_urls": excluded}
+        self._enqueue("replacement", track["id"], (replacement, settings), priority=True)
 
     def import_playlists(self, paths):
         self._enqueue("playlists", uuid.uuid4().hex, list(paths), priority=True)
@@ -138,9 +149,10 @@ class MusicJobs(QtCore.QThread):
 
     def cancel_track(self, track_id):
         with self.condition:
-            event = self.cancellations.get(("analysis", track_id))
-            if event:
-                event.set()
+            for kind in ("analysis", "replacement"):
+                event = self.cancellations.get((kind, track_id))
+                if event:
+                    event.set()
 
     def stop(self):
         with self.condition:
@@ -165,24 +177,34 @@ class MusicJobs(QtCore.QThread):
                 state = (int(percent), stage)
                 if state != last_progress:
                     last_progress = state
-                    self.progress.emit(identity if kind == "analysis" else payload[0], *state)
+                    if kind == "replacement":
+                        self.replacementProgress.emit(identity, *state)
+                    else:
+                        self.progress.emit(identity if kind == "analysis" else payload[0], *state)
 
             try:
                 check_cancel(cancel)
-                if kind == "analysis":
+                if kind in ("analysis", "replacement"):
                     track, settings = payload
                     path = track["path"]
+                    download = {}
                     if track.get("remote"):
                         download = self.downloader.fetch(track, cancel, report)
                         path = download["path"]
-                        self.downloaded.emit(identity, download)
+                        if kind == "analysis":
+                            self.downloaded.emit(identity, download)
                     result = self.analyser.analyse(path, cancel, lambda value, stage: report(20 + value * 0.7, stage))
                     if track.get("remote"):
                         result.update(title=track["title"], artist=track.get("artist", ""))
                     check_cancel(cancel)
                     timeline_path = self.generator.generate(result["cache_path"], settings, cancel,
                                                            lambda value, stage: report(90 + value * 0.1, stage))
-                    self.analysed.emit(identity, result | {"timeline_path": timeline_path})
+                    if kind == "replacement":
+                        self.replacementReady.emit(identity, result | download | {"timeline_path": timeline_path,
+                            "search_by_name": True, "download_revision": track["download_revision"],
+                            "excluded_urls": track["excluded_urls"]})
+                    else:
+                        self.analysed.emit(identity, result | {"timeline_path": timeline_path})
                 elif kind == "timeline":
                     track_id, analysis_path, settings = payload
                     path = self.generator.generate(analysis_path, settings, cancel, report)
@@ -219,8 +241,13 @@ class MusicJobs(QtCore.QThread):
             except CancelledAnalysis:
                 if kind == "analysis":
                     self.cancelled.emit(identity)
+                elif kind == "replacement":
+                    self.replacementFailed.emit(identity, "Поиск другой записи отменён")
             except Exception as exc:
-                self.failed.emit(identity if kind != "timeline" else payload[0], str(exc))
+                if kind == "replacement":
+                    self.replacementFailed.emit(identity, str(exc))
+                else:
+                    self.failed.emit(identity if kind != "timeline" else payload[0], str(exc))
             finally:
                 with self.condition:
                     self.cancellations.pop(key, None)

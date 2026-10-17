@@ -8,6 +8,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from music.analysis import ANALYSIS_VERSION
 from music.jobs import MusicJobs
+from music.matching import source_details
 from music.player import MusicPlayer
 from music.scheduler import LightShowScheduler
 from music.storage import DEFAULT_MUSIC_DIR, MusicLibrary, SUPPORTED_EXTENSIONS
@@ -77,6 +78,7 @@ class MusicPanel(QtWidgets.QWidget):
         self.measure_future = None
         self.import_dialog = None
         self.text_import_dialog = None
+        self.replacing = set()
         self.player = MusicPlayer(self.library.track, self, backend)
         self.player.queue.repeat = "off"
         self.player.queue.shuffle = bool(self.preferences.get("shuffle", False))
@@ -99,6 +101,9 @@ class MusicPanel(QtWidgets.QWidget):
         self.jobs.downloaded.connect(self._downloaded)
         self.jobs.textImported.connect(self._text_imported)
         self.jobs.importProgress.connect(self._import_progress)
+        self.jobs.replacementReady.connect(self._replacement_ready)
+        self.jobs.replacementFailed.connect(self._replacement_failed)
+        self.jobs.replacementProgress.connect(self._replacement_progress)
         self.settings_timer = QtCore.QTimer(self)
         self.settings_timer.setSingleShot(True)
         self.settings_timer.setInterval(180)
@@ -169,6 +174,7 @@ class MusicPanel(QtWidgets.QWidget):
             row.addWidget(self._button(label, callback))
         layout.addLayout(row)
         self.library_table = LibraryTable()
+        self._connect_track_menu(self.library_table)
         self.library_table.filesDropped.connect(self.import_paths)
         self.library_table.cellDoubleClicked.connect(lambda _row, _column: self.play_library_selection())
         layout.addWidget(self.library_table)
@@ -177,6 +183,7 @@ class MusicPanel(QtWidgets.QWidget):
         row.addWidget(QtWidgets.QLabel("Добавить выделенные треки:"))
         row.addWidget(self.add_playlist_combo, 1)
         row.addWidget(self._button("В плейлист", self.add_to_playlist))
+        row.addWidget(self._button("Другая запись", self.replace_library_recording))
         layout.addLayout(row)
         return page
 
@@ -200,11 +207,6 @@ class MusicPanel(QtWidgets.QWidget):
         self.playlist_tabs.setMovable(True)
         self.playlist_tabs.currentChanged.connect(self._playlist_tab_changed)
         layout.addWidget(self.playlist_tabs)
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self._button("Выше", lambda: self.move_playlist_track(-1)))
-        row.addWidget(self._button("Ниже", lambda: self.move_playlist_track(1)))
-        row.addWidget(self._button("Убрать трек", self.remove_playlist_track))
-        layout.addLayout(row)
         hint = QtWidgets.QLabel("Двойной щелчок: найти → скачать → проанализировать → играть. Скачанные треки доступны без сети.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -478,6 +480,7 @@ class MusicPanel(QtWidgets.QWidget):
             if widget is None:
                 widget = PlaylistTable()
                 widget.setProperty("playlist_id", playlist["id"])
+                self._connect_track_menu(widget)
                 widget.orderChanged.connect(self._playlist_order_changed)
                 widget.cellDoubleClicked.connect(lambda _row, _column: self.play_playlist())
                 self.playlist_lists[playlist["id"]] = widget
@@ -679,6 +682,14 @@ class MusicPanel(QtWidgets.QWidget):
             return
         fields = {key: metadata.get(key) for key in ("title", "artist", "album", "duration", "bpm",
                   "tempo_confidence", "content_id", "cache_path", "playback_path", "cover_path", "timeline_path")}
+        for key in ("path", "resolved_url", "resolved_title", "resolved_source", "source_codec", "source_bitrate_kbps",
+                    "source_sample_rate", "source_duration", "search_query", "selection_version", "search_by_name",
+                    "download_revision", "excluded_urls"):
+            if key in metadata:
+                fields[key] = metadata[key]
+        custom_title = self.library.track(track_id).get("custom_title")
+        if custom_title:
+            fields["title"] = custom_title
         self.library.update_track(track_id, **fields, analysis_version=ANALYSIS_VERSION,
                                   status="Ready", progress=100, error="")
         self.refresh_library()
@@ -704,7 +715,9 @@ class MusicPanel(QtWidgets.QWidget):
                 self.refresh_library()
 
     def remove_selected(self):
-        track_ids = self.selected_track_ids()
+        self._remove_tracks(self.selected_track_ids())
+
+    def _remove_tracks(self, track_ids):
         for track_id in track_ids:
             self.jobs.cancel_track(track_id)
         if self.player.current_track in track_ids:
@@ -716,13 +729,136 @@ class MusicPanel(QtWidgets.QWidget):
         self.refresh_playlists()
 
     def cancel_selected(self):
-        for track_id in self.selected_track_ids():
+        self._cancel_tracks(self.selected_track_ids())
+
+    def _cancel_tracks(self, track_ids):
+        for track_id in track_ids:
             self.jobs.cancel_track(track_id)
 
     def retry_selected(self):
-        for track_id in self.selected_track_ids():
-            self.enqueue_analysis(self.library.track(track_id))
+        self._analyse_tracks(self.selected_track_ids())
+
+    def _analyse_tracks(self, track_ids):
+        for track_id in track_ids:
+            track = self.library.track(track_id)
+            if track:
+                self.enqueue_analysis(track)
         self.refresh_library()
+        self._playlist_selected()
+
+    def _connect_track_menu(self, table):
+        table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        table.customContextMenuRequested.connect(lambda position: self._show_track_menu(table, position))
+
+    def _show_track_menu(self, table, position):
+        menu = self._track_context_menu(table, position)
+        if menu is not None:
+            menu.aboutToHide.connect(menu.deleteLater)
+            menu.popup(table.viewport().mapToGlobal(position))
+
+    def _track_context_menu(self, table, position):
+        index = table.indexAt(position)
+        if not index.isValid():
+            return None
+        playlist_id = table.property("playlist_id")
+        if playlist_id:
+            self.playlist_tabs.setCurrentWidget(table)
+        if not table.selectionModel().isRowSelected(index.row(), QtCore.QModelIndex()):
+            table.selectRow(index.row())
+        table.selectionModel().setCurrentIndex(index, QtCore.QItemSelectionModel.NoUpdate)
+        identities = [table.item(item.row(), 0).data(QtCore.Qt.UserRole)
+                      for item in table.selectionModel().selectedRows()]
+        menu = QtWidgets.QMenu(table)
+        menu.addAction("Воспроизвести", self.play_playlist if playlist_id else self.play_library_selection)
+        rename = menu.addAction("Переименовать", lambda: self.rename_track(identities[0]))
+        rename.setEnabled(len(identities) == 1)
+        menu.addAction("Проанализировать", lambda: self._analyse_tracks(identities))
+        menu.addAction("Отменить анализ", lambda: self._cancel_tracks(identities))
+        replacement = menu.addAction("Другая запись", lambda: self._replace_recordings(identities))
+        replacement.setEnabled(any((track := self.library.track(identity)) and track.get("remote")
+                                  and track.get("path") and track["status"] in ("Ready", "Error")
+                                  and identity not in self.replacing for identity in identities))
+        if playlist_id:
+            menu.addSeparator()
+            up = menu.addAction("Выше", lambda: self.move_playlist_track(-1))
+            down = menu.addAction("Ниже", lambda: self.move_playlist_track(1))
+            up.setEnabled(len(identities) == 1 and index.row() > 0)
+            down.setEnabled(len(identities) == 1 and index.row() < table.rowCount() - 1)
+        menu.addSeparator()
+        if playlist_id:
+            menu.addAction("Удалить из плейлиста", self.remove_playlist_track)
+        else:
+            menu.addAction("Удалить из библиотеки", lambda: self._remove_tracks(identities))
+        return menu
+
+    def rename_track(self, track_id):
+        track = self.library.track(track_id)
+        if not track:
+            return
+        title, accepted = QtWidgets.QInputDialog.getText(self, "Переименовать трек", "Название", text=track["title"])
+        if not accepted or not title.strip():
+            return
+        self.library.rename_track(track_id, title)
+        self.refresh_library()
+        self._playlist_selected()
+        if self.player.current_track == track_id:
+            self.now_title.setText(title.strip())
+            self.now_title.setToolTip(title.strip())
+        self._queue_changed(self.player.queue.ordered_tracks())
+
+    def replace_library_recording(self):
+        self._replace_recordings(self.selected_track_ids())
+
+    def replace_playlist_recording(self):
+        table = self.playlist_tracks
+        identities = [table.item(index.row(), 0).data(QtCore.Qt.UserRole)
+                      for index in table.selectionModel().selectedRows()]
+        self._replace_recordings(identities)
+
+    def _replace_recordings(self, identities):
+        queued = 0
+        for identity in dict.fromkeys(identities):
+            track = self.library.track(identity)
+            if (not track or not track.get("remote") or not track.get("path")
+                    or identity in self.replacing or track["status"] not in ("Ready", "Error")):
+                continue
+            self.replacing.add(identity)
+            self.jobs.replace_recording(track, dict(self.settings))
+            queued += 1
+        self.status.setText(f"Поиск других записей в фоне: {queued}." if queued else
+                            "Выберите уже скачанную из сети песню для поиска другой записи.")
+
+    def _replacement_progress(self, identity, percent, stage):
+        if self.closing or identity not in self.replacing:
+            return
+        track = self.library.track(identity)
+        if track:
+            self.status.setText(f"{track['title']}: {stage} · {percent}%")
+            for table in self.playlist_lists.values():
+                table.update_track(track | {"status": "Replacing"})
+
+    def _replacement_failed(self, identity, message):
+        self.replacing.discard(identity)
+        if self.closing:
+            return
+        track = self.library.track(identity)
+        if track:
+            for table in self.playlist_lists.values():
+                table.update_track(track)
+        self.status.setText("Другая запись: " + message)
+
+    def _replacement_ready(self, identity, metadata):
+        self.replacing.discard(identity)
+        if self.closing or not self.library.track(identity):
+            return
+        restart = (self.player.current_track == identity and self.player.prepared == identity
+                   and self.player.state in ("playing", "paused"))
+        self._analysed(identity, metadata)
+        if restart:
+            self.player.backend.stop()
+            self.player.prepared = None
+            self.player._request_current()
+        self.status.setText(f"Новая запись: {metadata['title']} · {source_details(metadata)}")
 
     def create_playlist(self):
         name, accepted = QtWidgets.QInputDialog.getText(self, "Создать плейлист", "Название")
@@ -918,7 +1054,10 @@ class MusicPanel(QtWidgets.QWidget):
         bpm = f"{track.get('bpm', 0):.1f}" if track and track.get("bpm") else "—"
         confidence = f"{track.get('tempo_confidence', 0):.0%}" if track else "—"
         self.now_details.setText(f"BPM: {bpm} · уверенность: {confidence} · энергия: {energy:.0%} · {self.settings['preset']}")
-        self.now_details.setToolTip(self.now_details.text())
+        details = source_details(track) if track else ""
+        if details:
+            self.now_details.setText(self.now_details.text() + " · " + details)
+        self.now_details.setToolTip(self.now_details.text() + ("\n" + track.get("resolved_url", "") if track else ""))
         self.previewReady.emit(bars, energy, colors)
 
     def _repeat_changed(self, remaining):

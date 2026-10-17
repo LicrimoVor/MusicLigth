@@ -146,11 +146,8 @@ class AudioVisualizer(QtWidgets.QWidget):
         root.setSpacing(12)
 
         header = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("Music Light")
-        title.setObjectName("title")
         self.connection_label = QtWidgets.QLabel(self.connection_summary())
         self.connection_label.setObjectName("muted")
-        header.addWidget(title)
         self.light_source_combo = QtWidgets.QComboBox()
         self.light_source_combo.addItem("Реальное время", "live")
         self.light_source_combo.addItem("Музыка", "player")
@@ -158,12 +155,12 @@ class AudioVisualizer(QtWidgets.QWidget):
         header.addWidget(self.light_source_combo)
         header.addStretch(1)
         header.addWidget(self.connection_label)
-        root.addLayout(header)
 
         self.music_panel = MusicPanel(self.device_ids, self.tuya_controller, self.async_loop,
                                       root=self.music_root, backend=self.music_backend, parent=self)
         root.addWidget(self.music_panel.player_header)
         self.music_panel.player_header.show()
+        root.addLayout(header)
         self.tabs = QtWidgets.QTabWidget()
         self.control_page = self.build_control_tab()
         self.beat_page = self.build_beat_tab()

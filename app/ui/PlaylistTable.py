@@ -1,4 +1,5 @@
 from PyQt5 import QtCore, QtGui, QtWidgets
+from music.matching import source_details
 
 
 class PlaylistTable(QtWidgets.QTableWidget):
@@ -53,6 +54,7 @@ class PlaylistTable(QtWidgets.QTableWidget):
             "NotDownloaded": ("↓ Не скачан", "#c4cdd6", "#2b343e"),
             "Pending": ("◷ В очереди", "#f4d58b", "#443b24"),
             "Analyzing": (f"◷ Анализ {track.get('progress', 0)}%", "#9cd9ff", "#203b50"),
+            "Replacing": ("◷ Другая запись…", "#9cd9ff", "#203b50"),
         }.get(status, (status, "#c4cdd6", "#2b343e"))
         values = [track["title"], track.get("artist") or "—", duration, str(track.get("play_count", 0)), label]
         for column, text in enumerate(values):
@@ -62,7 +64,9 @@ class PlaylistTable(QtWidgets.QTableWidget):
                 self.setItem(row, column, item)
             item.setText(text)
             item.setData(QtCore.Qt.UserRole, track["id"])
-            item.setToolTip(track.get("error") or text)
+            details = source_details(track)
+            item.setToolTip(track.get("error") or "\n".join(value for value in
+                (text, details, track.get("resolved_url", "")) if value))
             if column >= 2:
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
             if column == 4:

@@ -117,6 +117,17 @@ class MusicLibrary:
                     return copy.deepcopy(item)
         return None
 
+    def rename_track(self, track_id, title):
+        title = str(title).strip()
+        if not title:
+            raise ValueError("Введите название трека")
+        with self.lock:
+            track = self.track(track_id)
+            if track:
+                return self.update_track(track_id, title=title, custom_title=title,
+                                         original_title=track.get("original_title", track["title"]))
+        return None
+
     def record_listen(self, track_id):
         with self.lock:
             for track in self.data["tracks"]:
@@ -151,7 +162,7 @@ class MusicLibrary:
     def _remote_track(self, title, artist="", *, index=None, **fields):
         key = track_key(title, artist)
         existing = index.get(key) if index is not None else next((item for item in self.data["tracks"]
-                         if track_key(item["title"], item.get("artist", "")) == key), None)
+                         if track_key(item.get("original_title", item["title"]), item.get("artist", "")) == key), None)
         if existing:
             if fields.get("download_url") and not existing.get("download_url"):
                 existing["download_url"] = fields["download_url"]
@@ -196,7 +207,7 @@ class MusicLibrary:
                             "html_source": document["source"]}
                 self.data["playlists"].append(playlist)
             # Keep user edits and append new items when a copied export is updated.
-            index = {track_key(item["title"], item.get("artist", "")): item for item in self.data["tracks"]}
+            index = {track_key(item.get("original_title", item["title"]), item.get("artist", "")): item for item in self.data["tracks"]}
             for entry in document["entries"]:
                 track = self._remote_track(entry["title"], entry.get("artist", ""),
                                            index=index,
@@ -213,7 +224,7 @@ class MusicLibrary:
             playlist = next((item for item in self.data["playlists"] if item["id"] == playlist_id), None)
             if playlist is None:
                 raise KeyError(playlist_id)
-            index = {track_key(item["title"], item.get("artist", "")): item for item in self.data["tracks"]}
+            index = {track_key(item.get("original_title", item["title"]), item.get("artist", "")): item for item in self.data["tracks"]}
             added = 0
             known = set(playlist["tracks"])
             for entry in entries:
